@@ -27,9 +27,9 @@ from scanners.new_coins import (
 )
 
 
-# --------------------------------------------------
+# ==================================================
 # ENVIRONMENT
-# --------------------------------------------------
+# ==================================================
 
 load_dotenv()
 
@@ -41,9 +41,9 @@ if not TOKEN:
     )
 
 
-# --------------------------------------------------
+# ==================================================
 # DISCORD SETUP
-# --------------------------------------------------
+# ==================================================
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -57,9 +57,9 @@ bot = commands.Bot(
 monitor_lock = asyncio.Lock()
 
 
-# --------------------------------------------------
-# BOT STARTUP
-# --------------------------------------------------
+# ==================================================
+# STARTUP
+# ==================================================
 
 @bot.event
 async def on_ready():
@@ -77,9 +77,9 @@ async def on_ready():
         monitor_loop.start()
 
 
-# --------------------------------------------------
-# ALERT CHANNEL
-# --------------------------------------------------
+# ==================================================
+# GET DISCORD ALERT CHANNEL
+# ==================================================
 
 async def get_alert_channel():
 
@@ -91,19 +91,19 @@ async def get_alert_channel():
         return None
 
     try:
-
-        return bot.get_channel(
+        channel = bot.get_channel(
             int(channel_id)
         )
 
-    except (ValueError, TypeError):
+        return channel
 
+    except (ValueError, TypeError):
         return None
 
 
-# --------------------------------------------------
+# ==================================================
 # X / TWITTER MONITOR
-# --------------------------------------------------
+# ==================================================
 
 async def process_twitter():
 
@@ -115,11 +115,9 @@ async def process_twitter():
     channel = await get_alert_channel()
 
     if channel is None:
-
         print(
             "X monitor: no alert channel configured."
         )
-
         return
 
     for username in accounts:
@@ -155,7 +153,9 @@ async def process_twitter():
 
             alert_id = f"x:{post_id}"
 
-            if await alert_exists(alert_id):
+            if await alert_exists(
+                alert_id
+            ):
                 continue
 
             text = post.get(
@@ -185,19 +185,19 @@ async def process_twitter():
                 continue
 
             embed = discord.Embed(
-                title=f"🐦 @{username}",
+                title=f"🐦 New post from @{username}",
                 description=text[:4000],
                 color=discord.Color.blue()
             )
 
             embed.add_field(
-                name="Posted",
+                name="🕐 Posted",
                 value=created_at,
                 inline=False
             )
 
             embed.add_field(
-                name="Source",
+                name="🔗 Source",
                 value=f"[View post]({url})",
                 inline=False
             )
@@ -211,20 +211,18 @@ async def process_twitter():
             )
 
 
-# --------------------------------------------------
+# ==================================================
 # NEW TOKEN MONITOR
-# --------------------------------------------------
+# ==================================================
 
 async def process_new_tokens():
 
     channel = await get_alert_channel()
 
     if channel is None:
-
         print(
             "Token monitor: no alert channel configured."
         )
-
         return
 
     try:
@@ -288,34 +286,41 @@ async def process_new_tokens():
             continue
 
         message = (
-            f"**Network:** `{chain_id}`\n"
-            f"**Contract:** `{token_address}`"
+            "A new token profile was detected "
+            "by the public token feed."
         )
 
         if description:
-
             message += (
                 f"\n\n{description[:1000]}"
             )
 
-        if url:
-
-            message += (
-                f"\n\n[View source]({url})"
+        fields = [
+            (
+                "🌐 Network",
+                chain_id,
+                True
+            ),
+            (
+                "📋 Contract",
+                f"`{token_address}`",
+                False
             )
+        ]
 
         await send_alert(
-            channel,
-            "🆕 New Token Profile",
-            message,
-            "Token Monitor",
-            url
+            channel=channel,
+            title="🆕 New Token Profile Detected",
+            description=message,
+            alert_type="Token Monitor",
+            url=url,
+            fields=fields
         )
 
 
-# --------------------------------------------------
+# ==================================================
 # AUTOMATIC MONITORING LOOP
-# --------------------------------------------------
+# ==================================================
 
 @tasks.loop(minutes=2)
 async def monitor_loop():
@@ -341,9 +346,9 @@ async def before_monitor_loop():
     await bot.wait_until_ready()
 
 
-# --------------------------------------------------
-# BASIC COMMANDS
-# --------------------------------------------------
+# ==================================================
+# PING
+# ==================================================
 
 @bot.command()
 async def ping(ctx):
@@ -352,6 +357,10 @@ async def ping(ctx):
         "🏓 Crypto Monitor is online!"
     )
 
+
+# ==================================================
+# STATUS
+# ==================================================
 
 @bot.command()
 async def status(ctx):
@@ -399,9 +408,9 @@ async def status(ctx):
     )
 
 
-# --------------------------------------------------
+# ==================================================
 # SET ALERT CHANNEL
-# --------------------------------------------------
+# ==================================================
 
 @bot.command()
 @commands.has_permissions(
@@ -420,9 +429,9 @@ async def setchannel(ctx):
     )
 
 
-# --------------------------------------------------
-# X ACCOUNT COMMANDS
-# --------------------------------------------------
+# ==================================================
+# WATCH X ACCOUNT
+# ==================================================
 
 @bot.command()
 async def watch(ctx, username=None):
@@ -457,9 +466,13 @@ async def watch(ctx, username=None):
 
         await ctx.send(
             f"⚠️ **@{username}** "
-            f"is already monitored."
+            f"is already being monitored."
         )
 
+
+# ==================================================
+# UNWATCH X ACCOUNT
+# ==================================================
 
 @bot.command()
 async def unwatch(ctx, username=None):
@@ -494,9 +507,13 @@ async def unwatch(ctx, username=None):
 
         await ctx.send(
             f"⚠️ **@{username}** "
-            f"wasn't monitored."
+            f"wasn't being monitored."
         )
 
+
+# ==================================================
+# LIST ACCOUNTS
+# ==================================================
 
 @bot.command()
 async def accounts(ctx):
@@ -527,24 +544,27 @@ async def accounts(ctx):
     )
 
 
-# --------------------------------------------------
+# ==================================================
 # TEST ALERT
-# --------------------------------------------------
+# ==================================================
 
 @bot.command()
 async def testalert(ctx):
 
     await send_alert(
-        ctx.channel,
-        "🚨 Test Crypto Alert",
-        "The Discord alert system is working correctly.",
-        "Test Alert"
+        channel=ctx.channel,
+        title="🚨 Test Crypto Alert",
+        description=(
+            "The Discord alert system "
+            "is working correctly."
+        ),
+        alert_type="Test Alert"
     )
 
 
-# --------------------------------------------------
+# ==================================================
 # TEST TOKEN FEED
-# --------------------------------------------------
+# ==================================================
 
 @bot.command()
 async def testtokens(ctx):
@@ -562,7 +582,9 @@ async def testtokens(ctx):
 
     except Exception as error:
 
-        print(error)
+        print(
+            f"Token feed test error: {error}"
+        )
 
         await ctx.send(
             "❌ Token feed test failed. "
@@ -570,9 +592,83 @@ async def testtokens(ctx):
         )
 
 
-# --------------------------------------------------
+# ==================================================
+# MANUAL X SEARCH
+# ==================================================
+
+@bot.command()
+async def xsearch(ctx, *, query=None):
+
+    if not query:
+
+        await ctx.send(
+            "Usage: `!xsearch your search`"
+        )
+
+        return
+
+    try:
+
+        posts = await search_recent_posts(
+            query,
+            max_results=10
+        )
+
+        if not posts:
+
+            await ctx.send(
+                "🔎 No recent X posts found."
+            )
+
+            return
+
+        for post in posts[:5]:
+
+            text = post.get(
+                "text",
+                ""
+            )
+
+            post_id = post.get(
+                "id"
+            )
+
+            url = (
+                "https://x.com/i/web/status/"
+                f"{post_id}"
+            )
+
+            embed = discord.Embed(
+                title="🐦 X Post",
+                description=text[:4000],
+                color=discord.Color.blue()
+            )
+
+            embed.add_field(
+                name="🔗 Source",
+                value=f"[View post]({url})",
+                inline=False
+            )
+
+            await ctx.send(
+                embed=embed
+            )
+
+    except Exception as error:
+
+        print(
+            f"Manual X search error: {error}"
+        )
+
+        await ctx.send(
+            "❌ X search failed. "
+            "Check Railway logs."
+        )
+
+
+# ==================================================
 # COMMAND LIST
-# --------------------------------------------------
+# ==================================================
 
 @bot.command(name="commands")
 async def commands_list(ctx):
@@ -585,8 +681,8 @@ async def commands_list(ctx):
     embed.add_field(
         name="!setchannel",
         value=(
-            "Set the current channel as "
-            "the alert channel."
+            "Set the current channel "
+            "as the alert channel."
         ),
         inline=False
     )
@@ -616,6 +712,14 @@ async def commands_list(ctx):
     )
 
     embed.add_field(
+        name="!xsearch query",
+        value=(
+            "Search recent public X posts."
+        ),
+        inline=False
+    )
+
+    embed.add_field(
         name="!status",
         value=(
             "Show monitoring status."
@@ -634,7 +738,7 @@ async def commands_list(ctx):
     embed.add_field(
         name="!testtokens",
         value=(
-            "Test the new-token feed."
+            "Test the token data feed."
         ),
         inline=False
     )
@@ -644,9 +748,9 @@ async def commands_list(ctx):
     )
 
 
-# --------------------------------------------------
+# ==================================================
 # ERROR HANDLING
-# --------------------------------------------------
+# ==================================================
 
 @bot.event
 async def on_command_error(
@@ -666,8 +770,8 @@ async def on_command_error(
     ):
 
         await ctx.send(
-            "❌ You need the required "
-            "Discord permission for that command."
+            "❌ You don't have permission "
+            "to use that command."
         )
 
         return
@@ -677,8 +781,8 @@ async def on_command_error(
     )
 
 
-# --------------------------------------------------
+# ==================================================
 # START BOT
-# --------------------------------------------------
+# ==================================================
 
 bot.run(TOKEN)
