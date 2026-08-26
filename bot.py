@@ -19,7 +19,11 @@ from database import (
 from alerts import send_alert
 
 from scanners.twitter import search_recent_posts
-from scanners.new_coins import get_latest_token_profiles
+
+from scanners.new_coins import (
+    get_latest_token_profiles,
+    get_token_details
+)
 
 
 # ==================================================
@@ -37,7 +41,7 @@ if not TOKEN:
 
 
 # ==================================================
-# DISCORD
+# DISCORD SETUP
 # ==================================================
 
 intents = discord.Intents.default()
@@ -51,12 +55,13 @@ bot = commands.Bot(
 
 monitor_lock = asyncio.Lock()
 
-# Prevent repeated X API errors
+# X API is currently out of credits.
+# This prevents repeated API requests/errors.
 x_api_disabled = False
 
 
 # ==================================================
-# STARTUP
+# BOT STARTUP
 # ==================================================
 
 @bot.event
@@ -100,7 +105,7 @@ async def get_alert_channel():
 
 
 # ==================================================
-# X MONITOR
+# X / TWITTER MONITOR
 # ==================================================
 
 async def process_twitter():
@@ -139,7 +144,6 @@ async def process_twitter():
 
             error_text = str(error)
 
-            # X API credits depleted
             if (
                 "402" in error_text
                 or "credits_depleted" in error_text
@@ -157,7 +161,7 @@ async def process_twitter():
                 )
 
                 print(
-                    "The token monitor will continue running."
+                    "Token monitoring will continue."
                 )
 
                 return
@@ -178,9 +182,7 @@ async def process_twitter():
 
             alert_id = f"x:{post_id}"
 
-            if await alert_exists(
-                alert_id
-            ):
+            if await alert_exists(alert_id):
                 continue
 
             text = post.get(
@@ -253,6 +255,12 @@ async def process_new_tokens():
             await get_latest_token_profiles()
         )
 
+        token_details = (
+            await get_token_details(
+                profiles
+            )
+        )
+
     except Exception as error:
 
         print(
@@ -261,7 +269,16 @@ async def process_new_tokens():
 
         return
 
-    for token in profiles:
+    for item in token_details:
+
+        token = item.get(
+            "profile",
+            {}
+        )
+
+        market = item.get(
+            "market"
+        )
 
         chain_id = token.get(
             "chainId",
@@ -308,8 +325,8 @@ async def process_new_tokens():
             continue
 
         message = (
-            "A new token profile was detected "
-            "by the public token feed."
+            "A newly reported token profile "
+            "was detected by the public token feed."
         )
 
         if description:
@@ -331,6 +348,111 @@ async def process_new_tokens():
             )
         ]
 
+        # ------------------------------------------
+        # MARKET INFORMATION
+        # ------------------------------------------
+
+        if market:
+
+            base_token = market.get(
+                "baseToken",
+                {}
+            )
+
+            price = market.get(
+                "priceUsd"
+            )
+
+            liquidity_data = market.get(
+                "liquidity",
+                {}
+            )
+
+            volume_data = market.get(
+                "volume",
+                {}
+            )
+
+            liquidity = liquidity_data.get(
+                "usd"
+            )
+
+            volume = volume_data.get(
+                "h24"
+            )
+
+            market_name = base_token.get(
+                "name",
+                "Unknown"
+            )
+
+            market_symbol = base_token.get(
+                "symbol",
+                "Unknown"
+            )
+
+            fields.append(
+                (
+                    "🪙 Token",
+                    f"{market_name} ({market_symbol})",
+                    True
+                )
+            )
+
+            if price:
+
+                fields.append(
+                    (
+                        "💵 Price",
+                        f"${price}",
+                        True
+                    )
+                )
+
+            if isinstance(
+                liquidity,
+                (int, float)
+            ):
+
+                fields.append(
+                    (
+                        "💧 Liquidity",
+                        f"${liquidity:,.2f}",
+                        True
+                    )
+                )
+
+            if isinstance(
+                volume,
+                (int, float)
+            ):
+
+                fields.append(
+                    (
+                        "📊 24h Volume",
+                        f"${volume:,.2f}",
+                        True
+                    )
+                )
+
+            dex_name = market.get(
+                "dexId"
+            )
+
+            if dex_name:
+
+                fields.append(
+                    (
+                        "🏦 DEX",
+                        dex_name,
+                        True
+                    )
+                )
+
+        # ------------------------------------------
+        # SEND ALERT
+        # ------------------------------------------
+
         await send_alert(
             channel=channel,
             title="🆕 New Token Profile Detected",
@@ -342,7 +464,7 @@ async def process_new_tokens():
 
 
 # ==================================================
-# MONITOR LOOP
+# AUTOMATIC MONITORING
 # ==================================================
 
 @tasks.loop(minutes=2)
@@ -448,7 +570,7 @@ async def status(ctx):
 
 
 # ==================================================
-# SET CHANNEL
+# SET ALERT CHANNEL
 # ==================================================
 
 @bot.command()
@@ -469,7 +591,7 @@ async def setchannel(ctx):
 
 
 # ==================================================
-# WATCH
+# WATCH X ACCOUNT
 # ==================================================
 
 @bot.command()
@@ -510,7 +632,7 @@ async def watch(ctx, username=None):
 
 
 # ==================================================
-# UNWATCH
+# UNWATCH X ACCOUNT
 # ==================================================
 
 @bot.command()
@@ -551,7 +673,7 @@ async def unwatch(ctx, username=None):
 
 
 # ==================================================
-# ACCOUNTS
+# LIST ACCOUNTS
 # ==================================================
 
 @bot.command()
@@ -614,9 +736,22 @@ async def testtokens(ctx):
             await get_latest_token_profiles()
         )
 
+        details = (
+            await get_token_details(
+                profiles
+            )
+        )
+
+        market_count = sum(
+            1
+            for item in details
+            if item.get("market")
+        )
+
         await ctx.send(
-            f"🧪 Token feed returned "
-            f"**{len(profiles)}** profiles."
+            f"🧪 Token feed test complete.\n\n"
+            f"Profiles: **{len(profiles)}**\n"
+            f"Market data found: **{market_count}**"
         )
 
     except Exception as error:
@@ -632,7 +767,7 @@ async def testtokens(ctx):
 
 
 # ==================================================
-# X SEARCH
+# MANUAL X SEARCH
 # ==================================================
 
 @bot.command()
@@ -652,7 +787,7 @@ async def xsearch(ctx, *, query=None):
 
         await ctx.send(
             "🔴 X monitoring is currently paused "
-            "because the X API has no available credits."
+            "because X API credits are depleted."
         )
 
         return
@@ -789,7 +924,7 @@ async def commands_list(ctx):
 
     embed.add_field(
         name="!testtokens",
-        value="Test the token feed.",
+        value="Test token and market data.",
         inline=False
     )
 
@@ -799,7 +934,7 @@ async def commands_list(ctx):
 
 
 # ==================================================
-# ERROR HANDLER
+# ERROR HANDLING
 # ==================================================
 
 @bot.event
@@ -832,7 +967,7 @@ async def on_command_error(
 
 
 # ==================================================
-# RUN
+# START
 # ==================================================
 
 bot.run(TOKEN)
