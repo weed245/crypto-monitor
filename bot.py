@@ -18,13 +18,8 @@ from database import (
 
 from alerts import send_alert
 
-from scanners.twitter import (
-    search_recent_posts
-)
-
-from scanners.new_coins import (
-    get_latest_token_profiles
-)
+from scanners.twitter import search_recent_posts
+from scanners.new_coins import get_latest_token_profiles
 
 
 # ==================================================
@@ -42,7 +37,7 @@ if not TOKEN:
 
 
 # ==================================================
-# DISCORD SETUP
+# DISCORD
 # ==================================================
 
 intents = discord.Intents.default()
@@ -55,6 +50,9 @@ bot = commands.Bot(
 
 
 monitor_lock = asyncio.Lock()
+
+# Prevent repeated X API errors
+x_api_disabled = False
 
 
 # ==================================================
@@ -78,7 +76,7 @@ async def on_ready():
 
 
 # ==================================================
-# GET DISCORD ALERT CHANNEL
+# ALERT CHANNEL
 # ==================================================
 
 async def get_alert_channel():
@@ -91,21 +89,26 @@ async def get_alert_channel():
         return None
 
     try:
-        channel = bot.get_channel(
+
+        return bot.get_channel(
             int(channel_id)
         )
 
-        return channel
-
     except (ValueError, TypeError):
+
         return None
 
 
 # ==================================================
-# X / TWITTER MONITOR
+# X MONITOR
 # ==================================================
 
 async def process_twitter():
+
+    global x_api_disabled
+
+    if x_api_disabled:
+        return
 
     accounts = await get_accounts()
 
@@ -115,9 +118,6 @@ async def process_twitter():
     channel = await get_alert_channel()
 
     if channel is None:
-        print(
-            "X monitor: no alert channel configured."
-        )
         return
 
     for username in accounts:
@@ -136,6 +136,31 @@ async def process_twitter():
             )
 
         except Exception as error:
+
+            error_text = str(error)
+
+            # X API credits depleted
+            if (
+                "402" in error_text
+                or "credits_depleted" in error_text
+                or "Payment Required" in error_text
+            ):
+
+                x_api_disabled = True
+
+                print(
+                    "⚠️ X API credits are depleted."
+                )
+
+                print(
+                    "X monitoring is temporarily paused."
+                )
+
+                print(
+                    "The token monitor will continue running."
+                )
+
+                return
 
             print(
                 f"X API error for @{username}: "
@@ -220,9 +245,6 @@ async def process_new_tokens():
     channel = await get_alert_channel()
 
     if channel is None:
-        print(
-            "Token monitor: no alert channel configured."
-        )
         return
 
     try:
@@ -291,6 +313,7 @@ async def process_new_tokens():
         )
 
         if description:
+
             message += (
                 f"\n\n{description[:1000]}"
             )
@@ -319,7 +342,7 @@ async def process_new_tokens():
 
 
 # ==================================================
-# AUTOMATIC MONITORING LOOP
+# MONITOR LOOP
 # ==================================================
 
 @tasks.loop(minutes=2)
@@ -381,6 +404,22 @@ async def status(ctx):
         inline=True
     )
 
+    if x_api_disabled:
+
+        embed.add_field(
+            name="🐦 X Monitor",
+            value="🔴 Paused — X credits depleted",
+            inline=False
+        )
+
+    else:
+
+        embed.add_field(
+            name="🐦 X Monitor",
+            value="🟢 Active",
+            inline=False
+        )
+
     embed.add_field(
         name="🆕 Token Monitor",
         value="🟢 Active",
@@ -409,7 +448,7 @@ async def status(ctx):
 
 
 # ==================================================
-# SET ALERT CHANNEL
+# SET CHANNEL
 # ==================================================
 
 @bot.command()
@@ -430,7 +469,7 @@ async def setchannel(ctx):
 
 
 # ==================================================
-# WATCH X ACCOUNT
+# WATCH
 # ==================================================
 
 @bot.command()
@@ -471,7 +510,7 @@ async def watch(ctx, username=None):
 
 
 # ==================================================
-# UNWATCH X ACCOUNT
+# UNWATCH
 # ==================================================
 
 @bot.command()
@@ -512,7 +551,7 @@ async def unwatch(ctx, username=None):
 
 
 # ==================================================
-# LIST ACCOUNTS
+# ACCOUNTS
 # ==================================================
 
 @bot.command()
@@ -593,16 +632,27 @@ async def testtokens(ctx):
 
 
 # ==================================================
-# MANUAL X SEARCH
+# X SEARCH
 # ==================================================
 
 @bot.command()
 async def xsearch(ctx, *, query=None):
 
+    global x_api_disabled
+
     if not query:
 
         await ctx.send(
             "Usage: `!xsearch your search`"
+        )
+
+        return
+
+    if x_api_disabled:
+
+        await ctx.send(
+            "🔴 X monitoring is currently paused "
+            "because the X API has no available credits."
         )
 
         return
@@ -656,6 +706,23 @@ async def xsearch(ctx, *, query=None):
 
     except Exception as error:
 
+        error_text = str(error)
+
+        if (
+            "402" in error_text
+            or "credits_depleted" in error_text
+            or "Payment Required" in error_text
+        ):
+
+            x_api_disabled = True
+
+            await ctx.send(
+                "🔴 X API credits are depleted. "
+                "X monitoring has been paused."
+            )
+
+            return
+
         print(
             f"Manual X search error: {error}"
         )
@@ -667,7 +734,7 @@ async def xsearch(ctx, *, query=None):
 
 
 # ==================================================
-# COMMAND LIST
+# COMMANDS
 # ==================================================
 
 @bot.command(name="commands")
@@ -680,66 +747,49 @@ async def commands_list(ctx):
 
     embed.add_field(
         name="!setchannel",
-        value=(
-            "Set the current channel "
-            "as the alert channel."
-        ),
+        value="Set this channel for alerts.",
         inline=False
     )
 
     embed.add_field(
         name="!watch username",
-        value=(
-            "Monitor an X account."
-        ),
+        value="Monitor an X account.",
         inline=False
     )
 
     embed.add_field(
         name="!unwatch username",
-        value=(
-            "Stop monitoring an X account."
-        ),
+        value="Stop monitoring an X account.",
         inline=False
     )
 
     embed.add_field(
         name="!accounts",
-        value=(
-            "Show monitored X accounts."
-        ),
+        value="Show monitored X accounts.",
         inline=False
     )
 
     embed.add_field(
         name="!xsearch query",
-        value=(
-            "Search recent public X posts."
-        ),
+        value="Search recent public X posts.",
         inline=False
     )
 
     embed.add_field(
         name="!status",
-        value=(
-            "Show monitoring status."
-        ),
+        value="Show monitor status.",
         inline=False
     )
 
     embed.add_field(
         name="!testalert",
-        value=(
-            "Test Discord alerts."
-        ),
+        value="Test Discord alerts.",
         inline=False
     )
 
     embed.add_field(
         name="!testtokens",
-        value=(
-            "Test the token data feed."
-        ),
+        value="Test the token feed.",
         inline=False
     )
 
@@ -749,7 +799,7 @@ async def commands_list(ctx):
 
 
 # ==================================================
-# ERROR HANDLING
+# ERROR HANDLER
 # ==================================================
 
 @bot.event
@@ -782,7 +832,7 @@ async def on_command_error(
 
 
 # ==================================================
-# START BOT
+# RUN
 # ==================================================
 
 bot.run(TOKEN)
