@@ -38,16 +38,20 @@ async def init_database():
 
 
 async def alert_exists(alert_id):
+
     async with aiosqlite.connect(DATABASE_FILE) as db:
 
         cursor = await db.execute(
-            "SELECT 1 FROM alerts WHERE alert_id = ? LIMIT 1",
+            """
+            SELECT 1
+            FROM alerts
+            WHERE alert_id = ?
+            LIMIT 1
+            """,
             (alert_id,)
         )
 
-        result = await cursor.fetchone()
-
-        return result is not None
+        return await cursor.fetchone() is not None
 
 
 async def save_alert(
@@ -57,11 +61,13 @@ async def save_alert(
     content="",
     url=""
 ):
+
     async with aiosqlite.connect(DATABASE_FILE) as db:
 
         try:
 
-            await db.execute("""
+            await db.execute(
+                """
                 INSERT INTO alerts
                 (
                     alert_id,
@@ -71,13 +77,15 @@ async def save_alert(
                     url
                 )
                 VALUES (?, ?, ?, ?, ?)
-            """, (
-                alert_id,
-                alert_type,
-                title,
-                content,
-                url
-            ))
+                """,
+                (
+                    alert_id,
+                    alert_type,
+                    title,
+                    content,
+                    url
+                )
+            )
 
             await db.commit()
 
@@ -101,11 +109,14 @@ async def add_account(username):
 
         try:
 
-            await db.execute("""
+            await db.execute(
+                """
                 INSERT INTO monitored_accounts
                 (username, enabled)
                 VALUES (?, 1)
-            """, (username,))
+                """,
+                (username,)
+            )
 
             await db.commit()
 
@@ -127,10 +138,13 @@ async def remove_account(username):
 
     async with aiosqlite.connect(DATABASE_FILE) as db:
 
-        cursor = await db.execute("""
+        cursor = await db.execute(
+            """
             DELETE FROM monitored_accounts
             WHERE username = ?
-        """, (username,))
+            """,
+            (username,)
+        )
 
         await db.commit()
 
@@ -141,28 +155,40 @@ async def get_accounts():
 
     async with aiosqlite.connect(DATABASE_FILE) as db:
 
-        cursor = await db.execute("""
+        cursor = await db.execute(
+            """
             SELECT username
             FROM monitored_accounts
             WHERE enabled = 1
             ORDER BY username
-        """)
+            """
+        )
 
         rows = await cursor.fetchall()
 
-        return [row[0] for row in rows]
+        return [
+            row[0]
+            for row in rows
+        ]
 
 
 async def set_setting(key, value):
 
     async with aiosqlite.connect(DATABASE_FILE) as db:
 
-        await db.execute("""
-            INSERT INTO settings (key, value)
+        await db.execute(
+            """
+            INSERT INTO settings
+            (key, value)
             VALUES (?, ?)
             ON CONFLICT(key)
             DO UPDATE SET value = excluded.value
-        """, (key, value))
+            """,
+            (
+                key,
+                str(value)
+            )
+        )
 
         await db.commit()
 
@@ -171,11 +197,14 @@ async def get_setting(key):
 
     async with aiosqlite.connect(DATABASE_FILE) as db:
 
-        cursor = await db.execute("""
+        cursor = await db.execute(
+            """
             SELECT value
             FROM settings
             WHERE key = ?
-        """, (key,))
+            """,
+            (key,)
+        )
 
         row = await cursor.fetchone()
 
