@@ -89,15 +89,17 @@ async def watch(ctx, username=None):
         )
         return
 
+    username = username.replace("@", "").strip()
+
     added = await add_account(username)
 
     if added:
         await ctx.send(
-            f"🐦 Now monitoring **@{username.replace('@', '')}**."
+            f"🐦 Now monitoring **@{username}**."
         )
     else:
         await ctx.send(
-            f"⚠️ **@{username.replace('@', '')}** is already being monitored."
+            f"⚠️ **@{username}** is already being monitored."
         )
 
 
@@ -109,15 +111,17 @@ async def unwatch(ctx, username=None):
         )
         return
 
+    username = username.replace("@", "").strip()
+
     removed = await remove_account(username)
 
     if removed:
         await ctx.send(
-            f"🗑️ Stopped monitoring **@{username.replace('@', '')}**."
+            f"🗑️ Stopped monitoring **@{username}**."
         )
     else:
         await ctx.send(
-            f"⚠️ **@{username.replace('@', '')}** wasn't being monitored."
+            f"⚠️ **@{username}** wasn't being monitored."
         )
 
 
