@@ -12,6 +12,7 @@ if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN is missing")
 
 intents = discord.Intents.default()
+intents.message_content = True
 
 bot = commands.Bot(
     command_prefix="!",
