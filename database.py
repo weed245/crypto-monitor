@@ -1,0 +1,122 @@
+import aiosqlite
+
+
+DATABASE_FILE = "monitor.db"
+
+
+async def init_database():
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                alert_id TEXT UNIQUE NOT NULL,
+                alert_type TEXT NOT NULL,
+                title TEXT,
+                content TEXT,
+                url TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS monitored_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                enabled INTEGER DEFAULT 1
+            )
+        """)
+
+        await db.commit()
+
+
+async def alert_exists(alert_id):
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        cursor = await db.execute(
+            "SELECT 1 FROM alerts WHERE alert_id = ?",
+            (alert_id,)
+        )
+
+        result = await cursor.fetchone()
+
+        return result is not None
+
+
+async def save_alert(
+    alert_id,
+    alert_type,
+    title="",
+    content="",
+    url=""
+):
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        try:
+            await db.execute("""
+                INSERT INTO alerts
+                (alert_id, alert_type, title, content, url)
+                VALUES (?, ?, ?, ?, ?)
+            """, (
+                alert_id,
+                alert_type,
+                title,
+                content,
+                url
+            ))
+
+            await db.commit()
+            return True
+
+        except aiosqlite.IntegrityError:
+            return False
+
+
+async def add_account(username):
+    username = username.lower().replace("@", "").strip()
+
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        try:
+            await db.execute(
+                """
+                INSERT INTO monitored_accounts (username)
+                VALUES (?)
+                """,
+                (username,)
+            )
+
+            await db.commit()
+            return True
+
+        except aiosqlite.IntegrityError:
+            return False
+
+
+async def remove_account(username):
+    username = username.lower().replace("@", "").strip()
+
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        cursor = await db.execute(
+            """
+            DELETE FROM monitored_accounts
+            WHERE username = ?
+            """,
+            (username,)
+        )
+
+        await db.commit()
+
+        return cursor.rowcount > 0
+
+
+async def get_accounts():
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        cursor = await db.execute(
+            """
+            SELECT username
+            FROM monitored_accounts
+            WHERE enabled = 1
+            ORDER BY username
+            """
+        )
+
+        rows = await cursor.fetchall()
+
+        return [row[0] for row in rows]
