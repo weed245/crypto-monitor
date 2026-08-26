@@ -10,9 +10,32 @@ TOKEN_PAIRS_URL = (
 )
 
 
+# --------------------------------------------------
+# FILTER SETTINGS
+# --------------------------------------------------
+
+MIN_LIQUIDITY_USD = 1000
+MIN_VOLUME_24H_USD = 500
+
+ALLOWED_CHAINS = {
+    "solana",
+    "ethereum",
+    "base",
+    "bsc",
+    "arbitrum",
+    "polygon"
+}
+
+
+# --------------------------------------------------
+# GET TOKEN PROFILES
+# --------------------------------------------------
+
 async def get_latest_token_profiles():
 
-    timeout = aiohttp.ClientTimeout(total=30)
+    timeout = aiohttp.ClientTimeout(
+        total=30
+    )
 
     async with aiohttp.ClientSession(
         timeout=timeout
@@ -38,6 +61,10 @@ async def get_latest_token_profiles():
 
             return data
 
+
+# --------------------------------------------------
+# GET MARKET DATA
+# --------------------------------------------------
 
 async def get_token_market_data(
     session,
@@ -69,8 +96,8 @@ async def get_token_market_data(
             if not pairs:
                 return None
 
-            # Choose the pair with the largest
-            # reported liquidity when available.
+            # Prefer the pair with the
+            # highest reported liquidity.
             pairs.sort(
                 key=lambda pair: (
                     pair.get(
@@ -96,6 +123,57 @@ async def get_token_market_data(
         return None
 
 
+# --------------------------------------------------
+# FILTER TOKEN
+# --------------------------------------------------
+
+def token_passes_filter(
+    profile,
+    market
+):
+
+    chain_id = profile.get(
+        "chainId",
+        ""
+    ).lower()
+
+    if chain_id not in ALLOWED_CHAINS:
+        return False
+
+    if not market:
+        return False
+
+    liquidity = (
+        market.get(
+            "liquidity",
+            {}
+        ).get(
+            "usd"
+        ) or 0
+    )
+
+    volume = (
+        market.get(
+            "volume",
+            {}
+        ).get(
+            "h24"
+        ) or 0
+    )
+
+    if liquidity < MIN_LIQUIDITY_USD:
+        return False
+
+    if volume < MIN_VOLUME_24H_USD:
+        return False
+
+    return True
+
+
+# --------------------------------------------------
+# GET FILTERED TOKEN DETAILS
+# --------------------------------------------------
+
 async def get_token_details(
     profiles
 ):
@@ -110,14 +188,14 @@ async def get_token_details(
         timeout=timeout
     ) as session:
 
-        for token in profiles:
+        for profile in profiles:
 
-            chain_id = token.get(
+            chain_id = profile.get(
                 "chainId",
                 "unknown"
             )
 
-            token_address = token.get(
+            token_address = profile.get(
                 "tokenAddress"
             )
 
@@ -130,8 +208,14 @@ async def get_token_details(
                 token_address
             )
 
+            if not token_passes_filter(
+                profile,
+                market
+            ):
+                continue
+
             results.append({
-                "profile": token,
+                "profile": profile,
                 "market": market
             })
 
