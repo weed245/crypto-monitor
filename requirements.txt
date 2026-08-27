@@ -1,4 +1,4 @@
 discord.py
+ccxt
+pandas
 python-dotenv
-aiohttp
-aiosqlite
