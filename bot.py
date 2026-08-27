@@ -1,51 +1,84 @@
-import asyncio
 import os
-
+import asyncio
+import logging
+import ccxt
 import discord
+import pandas as pd
+
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
-from database import (
-    init_database,
-    add_account,
-    remove_account,
-    get_accounts,
-    alert_exists,
-    save_alert,
-    set_setting,
-    get_setting
-)
-
-from alerts import send_alert
-
-from scanners.twitter import search_recent_posts
-
-from scanners.new_coins import (
-    get_latest_token_profiles,
-    get_token_details,
-    DEFAULT_MIN_LIQUIDITY,
-    DEFAULT_MIN_VOLUME,
-    DEFAULT_CHAINS
-)
-
-
-# ==================================================
-# ENVIRONMENT
-# ==================================================
+# ============================================================
+# ⚙️ CONFIGURATION
+# ============================================================
 
 load_dotenv()
 
-TOKEN = os.getenv("DISCORD_TOKEN")
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+EXCHANGE_API_KEY = os.getenv("EXCHANGE_API_KEY")
+EXCHANGE_SECRET_KEY = os.getenv("EXCHANGE_SECRET_KEY")
 
-if not TOKEN:
-    raise RuntimeError(
-        "DISCORD_TOKEN is missing from Railway Variables"
-    )
+# Discord channel for automatic FOMO alerts.
+# Put your channel ID in .env:
+# ALERT_CHANNEL_ID=123456789012345678
+ALERT_CHANNEL_ID = int(os.getenv("ALERT_CHANNEL_ID", "0"))
+
+TIMEFRAME = "1h"
+
+FAST_MA = 9
+SLOW_MA = 21
+
+RSI_PERIOD = 14
+
+VOLUME_PERIOD = 20
+
+ATR_PERIOD = 14
+
+# How often automatic scanner runs
+SCAN_INTERVAL_MINUTES = 15
+
+# Minimum score before an automatic alert
+FOMO_ALERT_SCORE = 75
+DROP_ALERT_SCORE = 75
+
+# Coins to scan
+SCAN_SYMBOLS = [
+    "BTC/USDT",
+    "ETH/USDT",
+    "SOL/USDT",
+    "BNB/USDT",
+    "XRP/USDT",
+    "DOGE/USDT",
+    "ADA/USDT",
+    "AVAX/USDT",
+    "LINK/USDT",
+    "SUI/USDT",
+    "LTC/USDT",
+    "DOT/USDT",
+]
+
+# Existing trade amount
+TRADE_AMOUNT = 0.001
+
+# Existing paper-trading risk settings
+STOP_LOSS_PERCENT = 0.02
+TAKE_PROFIT_PERCENT = 0.04
 
 
-# ==================================================
-# DISCORD SETUP
-# ==================================================
+# ============================================================
+# 📝 LOGGING
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+
+
+# ============================================================
+# 🤖 DISCORD BOT
+# ============================================================
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -55,618 +88,993 @@ bot = commands.Bot(
     intents=intents
 )
 
-monitor_lock = asyncio.Lock()
 
-# X is currently out of API credits.
-x_api_disabled = False
+# ============================================================
+# 📡 EXCHANGE
+# ============================================================
+
+exchange = ccxt.binance({
+    "apiKey": EXCHANGE_API_KEY,
+    "secret": EXCHANGE_SECRET_KEY,
+    "enableRateLimit": True,
+    "options": {
+        "defaultType": "spot"
+    }
+})
+
+# Keep your existing sandbox/testnet setup.
+exchange.set_sandbox_mode(True)
 
 
-# ==================================================
-# DATABASE SETTINGS
-# ==================================================
+# ============================================================
+# 🧠 SCANNER STATE
+# ============================================================
 
-async def get_min_liquidity():
+scanner_running = False
 
-    value = await get_setting(
-        "min_liquidity"
-    )
+last_alerts = {}
 
-    if value is None:
-        return DEFAULT_MIN_LIQUIDITY
+current_position = None
+entry_price = None
 
+
+# ============================================================
+# 📊 MARKET DATA
+# ============================================================
+
+def fetch_market_data(symbol, timeframe=TIMEFRAME, limit=150):
     try:
-        return float(value)
-    except ValueError:
-        return DEFAULT_MIN_LIQUIDITY
+        bars = exchange.fetch_ohlcv(
+            symbol,
+            timeframe=timeframe,
+            limit=limit
+        )
+
+        if not bars:
+            return None
+
+        df = pd.DataFrame(
+            bars,
+            columns=[
+                "timestamp",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume"
+            ]
+        )
+
+        df["timestamp"] = pd.to_datetime(
+            df["timestamp"],
+            unit="ms"
+        )
+
+        return df
+
+    except Exception as e:
+        logging.error(
+            f"{symbol} market-data error: {e}"
+        )
+        return None
 
 
-async def get_min_volume():
+# ============================================================
+# 📈 INDICATORS
+# ============================================================
 
-    value = await get_setting(
-        "min_volume"
+def calculate_indicators(df):
+
+    if df is None or len(df) < 60:
+        return None
+
+    df = df.copy()
+
+    # -------------------------
+    # Moving averages
+    # -------------------------
+
+    df["fast_ma"] = (
+        df["close"]
+        .rolling(FAST_MA)
+        .mean()
     )
 
-    if value is None:
-        return DEFAULT_MIN_VOLUME
-
-    try:
-        return float(value)
-    except ValueError:
-        return DEFAULT_MIN_VOLUME
-
-
-async def get_allowed_chains():
-
-    value = await get_setting(
-        "allowed_chains"
+    df["slow_ma"] = (
+        df["close"]
+        .rolling(SLOW_MA)
+        .mean()
     )
 
-    if value is None:
-        return set(DEFAULT_CHAINS)
+    # -------------------------
+    # RSI - Wilder style
+    # -------------------------
 
-    chains = set()
+    delta = df["close"].diff()
 
-    for chain in value.split(","):
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
 
-        chain = chain.strip().lower()
+    avg_gain = gain.ewm(
+        alpha=1 / RSI_PERIOD,
+        adjust=False
+    ).mean()
 
-        if chain:
-            chains.add(chain)
+    avg_loss = loss.ewm(
+        alpha=1 / RSI_PERIOD,
+        adjust=False
+    ).mean()
 
-    if not chains:
-        return set(DEFAULT_CHAINS)
+    rs = avg_gain / avg_loss
 
-    return chains
+    df["rsi"] = 100 - (
+        100 / (1 + rs)
+    )
+
+    # -------------------------
+    # MACD
+    # -------------------------
+
+    ema12 = (
+        df["close"]
+        .ewm(span=12, adjust=False)
+        .mean()
+    )
+
+    ema26 = (
+        df["close"]
+        .ewm(span=26, adjust=False)
+        .mean()
+    )
+
+    df["macd"] = ema12 - ema26
+
+    df["macd_signal"] = (
+        df["macd"]
+        .ewm(span=9, adjust=False)
+        .mean()
+    )
+
+    df["macd_hist"] = (
+        df["macd"] -
+        df["macd_signal"]
+    )
+
+    # -------------------------
+    # Volume
+    # -------------------------
+
+    df["avg_volume"] = (
+        df["volume"]
+        .rolling(VOLUME_PERIOD)
+        .mean()
+    )
+
+    df["volume_ratio"] = (
+        df["volume"] /
+        df["avg_volume"]
+    )
+
+    # -------------------------
+    # ATR
+    # -------------------------
+
+    previous_close = df["close"].shift(1)
+
+    tr1 = df["high"] - df["low"]
+
+    tr2 = (
+        df["high"] -
+        previous_close
+    ).abs()
+
+    tr3 = (
+        df["low"] -
+        previous_close
+    ).abs()
+
+    true_range = pd.concat(
+        [tr1, tr2, tr3],
+        axis=1
+    ).max(axis=1)
+
+    df["atr"] = (
+        true_range
+        .rolling(ATR_PERIOD)
+        .mean()
+    )
+
+    # -------------------------
+    # Momentum
+    # -------------------------
+
+    df["momentum_1h"] = (
+        df["close"].pct_change(1) * 100
+    )
+
+    df["momentum_4h"] = (
+        df["close"].pct_change(4) * 100
+    )
+
+    df["momentum_24h"] = (
+        df["close"].pct_change(24) * 100
+    )
+
+    return df
 
 
-# ==================================================
-# BOT STARTUP
-# ==================================================
+# ============================================================
+# 🧠 FOMO / DROP AI-STYLE SCORING
+# ============================================================
+
+def analyze_symbol(symbol):
+
+    df = fetch_market_data(symbol)
+
+    if df is None:
+        return None
+
+    df = calculate_indicators(df)
+
+    if df is None:
+        return None
+
+    # IMPORTANT:
+    # -2 = most recently CLOSED candle
+    # -1 = currently forming candle
+    candle = df.iloc[-2]
+    previous = df.iloc[-3]
+
+    price = float(candle["close"])
+
+    fomo_score = 0
+    drop_score = 0
+
+    reasons_up = []
+    reasons_down = []
+
+    # ========================================================
+    # MA TREND
+    # ========================================================
+
+    if candle["fast_ma"] > candle["slow_ma"]:
+        fomo_score += 20
+        reasons_up.append("9 MA above 21 MA")
+
+    if candle["fast_ma"] < candle["slow_ma"]:
+        drop_score += 20
+        reasons_down.append("9 MA below 21 MA")
+
+    # ========================================================
+    # MA CROSS
+    # ========================================================
+
+    bullish_cross = (
+        previous["fast_ma"] <= previous["slow_ma"]
+        and
+        candle["fast_ma"] > candle["slow_ma"]
+    )
+
+    bearish_cross = (
+        previous["fast_ma"] >= previous["slow_ma"]
+        and
+        candle["fast_ma"] < candle["slow_ma"]
+    )
+
+    if bullish_cross:
+        fomo_score += 25
+        reasons_up.append("Bullish MA crossover")
+
+    if bearish_cross:
+        drop_score += 25
+        reasons_down.append("Bearish MA crossover")
+
+    # ========================================================
+    # RSI
+    # ========================================================
+
+    rsi = float(candle["rsi"])
+
+    if 50 <= rsi < 70:
+        fomo_score += 15
+        reasons_up.append(f"RSI bullish ({rsi:.1f})")
+
+    elif rsi >= 70:
+        # Very high RSI can indicate FOMO but also overheating.
+        fomo_score += 10
+        reasons_up.append(f"RSI overheated ({rsi:.1f})")
+
+        drop_score += 5
+        reasons_down.append("RSI potentially overheated")
+
+    elif rsi < 40:
+        drop_score += 15
+        reasons_down.append(f"Weak RSI ({rsi:.1f})")
+
+    # ========================================================
+    # MACD
+    # ========================================================
+
+    macd = float(candle["macd"])
+    macd_signal = float(candle["macd_signal"])
+
+    if macd > macd_signal:
+        fomo_score += 15
+        reasons_up.append("MACD bullish")
+
+    else:
+        drop_score += 15
+        reasons_down.append("MACD bearish")
+
+    # ========================================================
+    # VOLUME
+    # ========================================================
+
+    volume_ratio = float(candle["volume_ratio"])
+
+    if volume_ratio >= 1.5:
+        fomo_score += 15
+        drop_score += 10
+
+        reasons_up.append(
+            f"Volume spike {volume_ratio:.1f}x"
+        )
+
+        reasons_down.append(
+            f"High volume {volume_ratio:.1f}x"
+        )
+
+    elif volume_ratio >= 1.2:
+
+        fomo_score += 8
+
+        reasons_up.append(
+            f"Volume {volume_ratio:.1f}x average"
+        )
+
+    # ========================================================
+    # MOMENTUM
+    # ========================================================
+
+    momentum_1h = float(
+        candle["momentum_1h"]
+    )
+
+    momentum_4h = float(
+        candle["momentum_4h"]
+    )
+
+    if momentum_1h > 0.5:
+        fomo_score += 8
+        reasons_up.append(
+            f"1h momentum +{momentum_1h:.2f}%"
+        )
+
+    elif momentum_1h < -0.5:
+        drop_score += 8
+        reasons_down.append(
+            f"1h momentum {momentum_1h:.2f}%"
+        )
+
+    if momentum_4h > 1:
+        fomo_score += 7
+        reasons_up.append(
+            f"4h momentum +{momentum_4h:.2f}%"
+        )
+
+    elif momentum_4h < -1:
+        drop_score += 7
+        reasons_down.append(
+            f"4h momentum {momentum_4h:.2f}%"
+        )
+
+    # ========================================================
+    # PRICE CHANGE
+    # ========================================================
+
+    candle_open = float(candle["open"])
+
+    candle_change = (
+        (price - candle_open) /
+        candle_open
+    ) * 100
+
+    if candle_change > 1:
+        fomo_score += 5
+        reasons_up.append(
+            f"Candle +{candle_change:.2f}%"
+        )
+
+    elif candle_change < -1:
+        drop_score += 5
+        reasons_down.append(
+            f"Candle {candle_change:.2f}%"
+        )
+
+    # ========================================================
+    # LIMIT SCORES
+    # ========================================================
+
+    fomo_score = min(100, max(0, fomo_score))
+    drop_score = min(100, max(0, drop_score))
+
+    # ========================================================
+    # DIRECTION
+    # ========================================================
+
+    if fomo_score >= drop_score:
+        direction = "PUMP WATCH"
+    else:
+        direction = "DROP WATCH"
+
+    return {
+        "symbol": symbol,
+        "price": price,
+        "fomo_score": fomo_score,
+        "drop_score": drop_score,
+        "direction": direction,
+        "rsi": rsi,
+        "volume_ratio": volume_ratio,
+        "momentum_1h": momentum_1h,
+        "momentum_4h": momentum_4h,
+        "ma_fast": float(candle["fast_ma"]),
+        "ma_slow": float(candle["slow_ma"]),
+        "macd": macd,
+        "macd_signal": macd_signal,
+        "reasons_up": reasons_up,
+        "reasons_down": reasons_down
+    }
+
+
+# ============================================================
+# 📊 SCAN ALL COINS
+# ============================================================
+
+def scan_market():
+
+    results = []
+
+    for symbol in SCAN_SYMBOLS:
+
+        try:
+
+            result = analyze_symbol(symbol)
+
+            if result:
+                results.append(result)
+
+        except Exception as e:
+
+            logging.error(
+                f"Scanner error for {symbol}: {e}"
+            )
+
+    return results
+
+
+# ============================================================
+# 💬 FORMAT ALERT
+# ============================================================
+
+def create_signal_embed(result):
+
+    symbol = result["symbol"]
+
+    fomo = result["fomo_score"]
+    drop = result["drop_score"]
+
+    if fomo >= drop:
+
+        embed = discord.Embed(
+            title="🚀 FOMO AI ALERT",
+            description=(
+                f"**{symbol}**\n"
+                f"Potential upward momentum detected."
+            ),
+            color=discord.Color.green()
+        )
+
+        embed.add_field(
+            name="🔥 FOMO Score",
+            value=f"**{fomo}/100**",
+            inline=True
+        )
+
+        embed.add_field(
+            name="📉 Drop Score",
+            value=f"{drop}/100",
+            inline=True
+        )
+
+        reasons = result["reasons_up"]
+
+    else:
+
+        embed = discord.Embed(
+            title="📉 DROP AI ALERT",
+            description=(
+                f"**{symbol}**\n"
+                f"Potential downward pressure detected."
+            ),
+            color=discord.Color.red()
+        )
+
+        embed.add_field(
+            name="📈 FOMO Score",
+            value=f"{fomo}/100",
+            inline=True
+        )
+
+        embed.add_field(
+            name="🔻 Drop Score",
+            value=f"**{drop}/100**",
+            inline=True
+        )
+
+        reasons = result["reasons_down"]
+
+    embed.add_field(
+        name="💰 Price",
+        value=f"${result['price']:,.4f}",
+        inline=False
+    )
+
+    embed.add_field(
+        name="📊 RSI",
+        value=f"{result['rsi']:.1f}",
+        inline=True
+    )
+
+    embed.add_field(
+        name="📊 Volume",
+        value=f"{result['volume_ratio']:.2f}x avg",
+        inline=True
+    )
+
+    embed.add_field(
+        name="⚡ Momentum",
+        value=(
+            f"1h: {result['momentum_1h']:+.2f}%\n"
+            f"4h: {result['momentum_4h']:+.2f}%"
+        ),
+        inline=True
+    )
+
+    reason_text = "\n".join(
+        f"• {reason}"
+        for reason in reasons[:6]
+    )
+
+    if not reason_text:
+        reason_text = "No major confirmation."
+
+    embed.add_field(
+        name="🧠 Why?",
+        value=reason_text,
+        inline=False
+    )
+
+    embed.set_footer(
+        text="Market analysis only • Not a guaranteed prediction"
+    )
+
+    return embed
+
+
+# ============================================================
+# 📢 SEND ALERT
+# ============================================================
+
+async def send_signal(result):
+
+    if ALERT_CHANNEL_ID == 0:
+        logging.warning(
+            "ALERT_CHANNEL_ID is not configured."
+        )
+        return
+
+    channel = bot.get_channel(ALERT_CHANNEL_ID)
+
+    if channel is None:
+        logging.warning(
+            "Could not find alert channel."
+        )
+        return
+
+    embed = create_signal_embed(result)
+
+    await channel.send(
+        embed=embed
+    )
+
+
+# ============================================================
+# ⏱️ AUTOMATIC FOMO WATCHER
+# ============================================================
+
+@tasks.loop(minutes=SCAN_INTERVAL_MINUTES)
+async def fomo_watcher():
+
+    global last_alerts
+
+    logging.info(
+        "🔎 Running automatic FOMO scan..."
+    )
+
+    results = await asyncio.to_thread(
+        scan_market
+    )
+
+    if not results:
+        logging.warning(
+            "No scanner results."
+        )
+        return
+
+    # Sort strongest signals
+    strongest_fomo = sorted(
+        results,
+        key=lambda x: x["fomo_score"],
+        reverse=True
+    )
+
+    strongest_drops = sorted(
+        results,
+        key=lambda x: x["drop_score"],
+        reverse=True
+    )
+
+    # Top FOMO signal
+    if strongest_fomo:
+
+        result = strongest_fomo[0]
+
+        if result["fomo_score"] >= FOMO_ALERT_SCORE:
+
+            key = (
+                result["symbol"],
+                "FOMO"
+            )
+
+            if key not in last_alerts:
+
+                await send_signal(result)
+
+                last_alerts[key] = True
+
+    # Top drop signal
+    if strongest_drops:
+
+        result = strongest_drops[0]
+
+        if result["drop_score"] >= DROP_ALERT_SCORE:
+
+            key = (
+                result["symbol"],
+                "DROP"
+            )
+
+            if key not in last_alerts:
+
+                await send_signal(result)
+
+                last_alerts[key] = True
+
+    # Reset alert memory when signals weaken
+    for key in list(last_alerts):
+
+        symbol, signal_type = key
+
+        matching = next(
+            (
+                x for x in results
+                if x["symbol"] == symbol
+            ),
+            None
+        )
+
+        if matching is None:
+            continue
+
+        if signal_type == "FOMO":
+            if matching["fomo_score"] < 60:
+                del last_alerts[key]
+
+        elif signal_type == "DROP":
+            if matching["drop_score"] < 60:
+                del last_alerts[key]
+
+    logging.info(
+        f"Scan complete: {len(results)} coins analyzed."
+    )
+
+
+# ============================================================
+# 🤖 BOT READY
+# ============================================================
 
 @bot.event
 async def on_ready():
 
-    await init_database()
-
-    # Create default settings if they don't exist.
-
-    if await get_setting("min_liquidity") is None:
-
-        await set_setting(
-            "min_liquidity",
-            DEFAULT_MIN_LIQUIDITY
-        )
-
-    if await get_setting("min_volume") is None:
-
-        await set_setting(
-            "min_volume",
-            DEFAULT_MIN_VOLUME
-        )
-
-    if await get_setting("allowed_chains") is None:
-
-        await set_setting(
-            "allowed_chains",
-            ",".join(sorted(DEFAULT_CHAINS))
-        )
-
-    print("=" * 60)
-    print(f"Logged in as: {bot.user}")
-    print(f"Bot ID: {bot.user.id}")
-    print("Database initialized")
-    print("Crypto Monitor is ONLINE")
-    print("=" * 60)
-
-    if not monitor_loop.is_running():
-        monitor_loop.start()
-
-
-# ==================================================
-# ALERT CHANNEL
-# ==================================================
-
-async def get_alert_channel():
-
-    channel_id = await get_setting(
-        "alert_channel_id"
+    logging.info(
+        f"✅ Logged in as {bot.user}"
     )
 
-    if not channel_id:
-        return None
+    try:
+
+        await asyncio.to_thread(
+            exchange.load_markets
+        )
+
+        logging.info(
+            "📊 Binance connection successful."
+        )
+
+    except Exception as e:
+
+        logging.error(
+            f"Exchange connection error: {e}"
+        )
+
+    if not fomo_watcher.is_running():
+
+        fomo_watcher.start()
+
+        logging.info(
+            "🔎 Automatic FOMO watcher started."
+        )
+
+
+# ============================================================
+# 💰 EXISTING !price COMMAND
+# ============================================================
+
+@bot.command(name="price")
+async def get_price(
+    ctx,
+    symbol: str = "BTC/USDT"
+):
 
     try:
 
-        return bot.get_channel(
-            int(channel_id)
+        ticker = await asyncio.to_thread(
+            exchange.fetch_ticker,
+            symbol
         )
 
-    except (ValueError, TypeError):
+        price = ticker["last"]
 
-        return None
-
-
-# ==================================================
-# X / TWITTER MONITOR
-# ==================================================
-
-async def process_twitter():
-
-    global x_api_disabled
-
-    if x_api_disabled:
-        return
-
-    accounts = await get_accounts()
-
-    if not accounts:
-        return
-
-    channel = await get_alert_channel()
-
-    if channel is None:
-        return
-
-    for username in accounts:
-
-        query = (
-            f"from:{username} "
-            "-is:retweet "
-            "-is:reply"
+        await ctx.send(
+            f"📈 Current **{symbol}** price: "
+            f"`${price:,.2f}`"
         )
 
-        try:
+    except Exception as e:
 
-            posts = await search_recent_posts(
-                query,
-                max_results=10
-            )
-
-        except Exception as error:
-
-            error_text = str(error)
-
-            if (
-                "402" in error_text
-                or "credits_depleted" in error_text
-                or "Payment Required" in error_text
-            ):
-
-                x_api_disabled = True
-
-                print(
-                    "X API credits depleted."
-                )
-
-                print(
-                    "X monitoring paused."
-                )
-
-                return
-
-            print(
-                f"X API error for @{username}: "
-                f"{error}"
-            )
-
-            continue
-
-        for post in reversed(posts):
-
-            post_id = post.get("id")
-
-            if not post_id:
-                continue
-
-            alert_id = f"x:{post_id}"
-
-            if await alert_exists(
-                alert_id
-            ):
-                continue
-
-            text = post.get(
-                "text",
-                ""
-            )
-
-            created_at = post.get(
-                "created_at",
-                "Unknown"
-            )
-
-            url = (
-                "https://x.com/i/web/status/"
-                f"{post_id}"
-            )
-
-            saved = await save_alert(
-                alert_id=alert_id,
-                alert_type="X Monitor",
-                title=f"New post from @{username}",
-                content=text,
-                url=url
-            )
-
-            if not saved:
-                continue
-
-            embed = discord.Embed(
-                title=f"🐦 New post from @{username}",
-                description=text[:4000],
-                color=discord.Color.blue()
-            )
-
-            embed.add_field(
-                name="🕐 Posted",
-                value=created_at,
-                inline=False
-            )
-
-            embed.add_field(
-                name="🔗 Source",
-                value=f"[View post]({url})",
-                inline=False
-            )
-
-            embed.set_footer(
-                text="Crypto Monitor • X Monitor"
-            )
-
-            await channel.send(
-                embed=embed
-            )
+        await ctx.send(
+            f"❌ Error fetching price: `{e}`"
+        )
 
 
-# ==================================================
-# NEW TOKEN MONITOR
-# ==================================================
+# ============================================================
+# 💵 EXISTING !buy COMMAND
+# ============================================================
 
-async def process_new_tokens():
+@bot.command(name="buy")
+async def buy_bitcoin(
+    ctx,
+    amount: float
+):
 
-    channel = await get_alert_channel()
-
-    if channel is None:
-        return
-
-    min_liquidity = await get_min_liquidity()
-
-    min_volume = await get_min_volume()
-
-    allowed_chains = await get_allowed_chains()
+    symbol = "BTC/USDT"
 
     try:
 
-        profiles = (
-            await get_latest_token_profiles()
+        await ctx.send(
+            f"🔄 Processing paper buy order "
+            f"for {amount} BTC..."
         )
 
-        token_details = await get_token_details(
-            profiles,
-            min_liquidity=min_liquidity,
-            min_volume=min_volume,
-            allowed_chains=allowed_chains
+        order = await asyncio.to_thread(
+            exchange.create_market_buy_order,
+            symbol,
+            amount
         )
 
-    except Exception as error:
-
-        print(
-            f"Token monitor error: {error}"
+        embed = discord.Embed(
+            title="✅ Order Executed Successfully",
+            color=discord.Color.green()
         )
 
-        return
-
-    for item in token_details:
-
-        token = item.get(
-            "profile",
-            {}
+        embed.add_field(
+            name="Symbol",
+            value=order["symbol"],
+            inline=True
         )
 
-        market = item.get(
-            "market"
+        embed.add_field(
+            name="Type",
+            value=order["type"].upper(),
+            inline=True
         )
 
-        chain_id = token.get(
-            "chainId",
-            "unknown"
+        embed.add_field(
+            name="Amount",
+            value=f"{order['amount']} BTC",
+            inline=True
         )
 
-        token_address = token.get(
-            "tokenAddress"
+        embed.add_field(
+            name="Status",
+            value=order["status"].upper(),
+            inline=False
         )
 
-        description = token.get(
-            "description"
+        await ctx.send(
+            embed=embed
         )
 
-        url = token.get(
-            "url"
-        )
+    except Exception as e:
 
-        if not token_address:
-            continue
-
-        alert_id = (
-            f"token:{chain_id}:"
-            f"{token_address}"
-        )
-
-        if await alert_exists(
-            alert_id
-        ):
-            continue
-
-        saved = await save_alert(
-            alert_id=alert_id,
-            alert_type="New Token Profile",
-            title="New token profile detected",
-            content=(
-                f"{chain_id} "
-                f"{token_address}"
-            ),
-            url=url or ""
-        )
-
-        if not saved:
-            continue
-
-        message = (
-            "A newly reported token profile "
-            "passed your configured filters."
-        )
-
-        if description:
-
-            message += (
-                f"\n\n{description[:1000]}"
-            )
-
-        fields = [
-            (
-                "🌐 Network",
-                chain_id,
-                True
-            ),
-            (
-                "📋 Contract",
-                f"`{token_address}`",
-                False
-            )
-        ]
-
-        if market:
-
-            base_token = market.get(
-                "baseToken",
-                {}
-            )
-
-            price = market.get(
-                "priceUsd"
-            )
-
-            liquidity = (
-                market.get(
-                    "liquidity",
-                    {}
-                ).get(
-                    "usd"
-                )
-            )
-
-            volume = (
-                market.get(
-                    "volume",
-                    {}
-                ).get(
-                    "h24"
-                )
-            )
-
-            market_name = base_token.get(
-                "name",
-                "Unknown"
-            )
-
-            market_symbol = base_token.get(
-                "symbol",
-                "Unknown"
-            )
-
-            fields.append(
-                (
-                    "🪙 Token",
-                    f"{market_name} ({market_symbol})",
-                    True
-                )
-            )
-
-            if price:
-
-                fields.append(
-                    (
-                        "💵 Price",
-                        f"${price}",
-                        True
-                    )
-                )
-
-            if isinstance(
-                liquidity,
-                (int, float)
-            ):
-
-                fields.append(
-                    (
-                        "💧 Liquidity",
-                        f"${liquidity:,.2f}",
-                        True
-                    )
-                )
-
-            if isinstance(
-                volume,
-                (int, float)
-            ):
-
-                fields.append(
-                    (
-                        "📊 24h Volume",
-                        f"${volume:,.2f}",
-                        True
-                    )
-                )
-
-            dex_name = market.get(
-                "dexId"
-            )
-
-            if dex_name:
-
-                fields.append(
-                    (
-                        "🏦 DEX",
-                        dex_name,
-                        True
-                    )
-                )
-
-        await send_alert(
-            channel=channel,
-            title="🆕 New Token Profile Detected",
-            description=message,
-            alert_type="Token Monitor",
-            url=url,
-            fields=fields
+        await ctx.send(
+            f"❌ Order Failed: `{e}`"
         )
 
 
-# ==================================================
-# AUTOMATIC MONITORING LOOP
-# ==================================================
+# ============================================================
+# 💸 EXISTING !sell COMMAND
+# ============================================================
 
-@tasks.loop(minutes=2)
-async def monitor_loop():
+@bot.command(name="sell")
+async def sell_bitcoin(
+    ctx,
+    amount: float
+):
 
-    async with monitor_lock:
+    symbol = "BTC/USDT"
 
-        print(
-            "Running monitoring cycle..."
+    try:
+
+        await ctx.send(
+            f"🔄 Processing paper sell order "
+            f"for {amount} BTC..."
         )
 
-        await process_twitter()
+        order = await asyncio.to_thread(
+            exchange.create_market_sell_order,
+            symbol,
+            amount
+        )
 
-        await process_new_tokens()
+        embed = discord.Embed(
+            title="✅ Order Executed Successfully",
+            color=discord.Color.red()
+        )
 
-        print(
-            "Monitoring cycle complete."
+        embed.add_field(
+            name="Symbol",
+            value=order["symbol"],
+            inline=True
+        )
+
+        embed.add_field(
+            name="Type",
+            value=order["type"].upper(),
+            inline=True
+        )
+
+        embed.add_field(
+            name="Amount",
+            value=f"{order['amount']} BTC",
+            inline=True
+        )
+
+        embed.add_field(
+            name="Status",
+            value=order["status"].upper(),
+            inline=False
+        )
+
+        await ctx.send(
+            embed=embed
+        )
+
+    except Exception as e:
+
+        await ctx.send(
+            f"❌ Order Failed: `{e}`"
         )
 
 
-@monitor_loop.before_loop
-async def before_monitor_loop():
+# ============================================================
+# 💰 EXISTING !balance COMMAND
+# ============================================================
 
-    await bot.wait_until_ready()
+@bot.command(name="balance")
+async def get_balance(ctx):
+
+    try:
+
+        balance = await asyncio.to_thread(
+            exchange.fetch_balance
+        )
+
+        btc_free = (
+            balance
+            .get("BTC", {})
+            .get("free", 0.0)
+        )
+
+        usdt_free = (
+            balance
+            .get("USDT", {})
+            .get("free", 0.0)
+        )
+
+        await ctx.send(
+            "💰 **Your Paper Wallet Balance:**\n"
+            f"• **USDT:** ${usdt_free:,.2f}\n"
+            f"• **BTC:** {btc_free} BTC"
+        )
+
+    except Exception as e:
+
+        await ctx.send(
+            f"❌ Error fetching balance: `{e}`"
+        )
 
 
-# ==================================================
-# PING
-# ==================================================
+# ============================================================
+# 🚀 !fomo COMMAND
+# ============================================================
 
-@bot.command()
-async def ping(ctx):
+@bot.command(name="fomo")
+async def fomo_command(ctx):
 
     await ctx.send(
-        "🏓 Crypto Monitor is online!"
+        "🔎 Scanning the market for the "
+        "strongest FOMO setups..."
     )
 
+    results = await asyncio.to_thread(
+        scan_market
+    )
 
-# ==================================================
-# STATUS
-# ==================================================
+    results = sorted(
+        results,
+        key=lambda x: x["fomo_score"],
+        reverse=True
+    )
 
-@bot.command()
-async def status(ctx):
+    results = results[:5]
 
-    accounts = await get_accounts()
+    if not results:
 
-    channel = await get_alert_channel()
-
-    min_liquidity = await get_min_liquidity()
-
-    min_volume = await get_min_volume()
-
-    chains = await get_allowed_chains()
+        await ctx.send(
+            "❌ No market data available."
+        )
+        return
 
     embed = discord.Embed(
-        title="🟢 Crypto Monitor",
-        description="Monitoring system is online.",
+        title="🚀 FOMO AI — Top Setups",
         color=discord.Color.green()
     )
 
-    embed.add_field(
-        name="🐦 X Accounts",
-        value=str(len(accounts)),
-        inline=True
-    )
-
-    if x_api_disabled:
+    for result in results:
 
         embed.add_field(
-            name="🐦 X Monitor",
-            value="🔴 Paused — X credits depleted",
-            inline=True
-        )
-
-    else:
-
-        embed.add_field(
-            name="🐦 X Monitor",
-            value="🟢 Active",
-            inline=True
-        )
-
-    embed.add_field(
-        name="🆕 Token Monitor",
-        value="🟢 Active",
-        inline=True
-    )
-
-    embed.add_field(
-        name="💧 Min Liquidity",
-        value=f"${min_liquidity:,.0f}",
-        inline=True
-    )
-
-    embed.add_field(
-        name="📊 Min 24h Volume",
-        value=f"${min_volume:,.0f}",
-        inline=True
-    )
-
-    embed.add_field(
-        name="🌐 Chains",
-        value=", ".join(
-            sorted(chains)
-        ),
-        inline=False
-    )
-
-    if channel:
-
-        embed.add_field(
-            name="🚨 Alert Channel",
-            value=channel.mention,
-            inline=True
-        )
-
-    else:
-
-        embed.add_field(
-            name="🚨 Alert Channel",
-            value="❌ Not configured",
-            inline=True
+            name=(
+                f"{result['symbol']} — "
+                f"{result['fomo_score']}/100"
+            ),
+            value=(
+                f"💰 ${result['price']:,.4f}\n"
+                f"RSI: {result['rsi']:.1f} | "
+                f"Volume: {result['volume_ratio']:.1f}x\n"
+                f"Momentum: "
+                f"{result['momentum_1h']:+.2f}%"
+            ),
+            inline=False
         )
 
     await ctx.send(
@@ -674,412 +1082,131 @@ async def status(ctx):
     )
 
 
-# ==================================================
-# SET ALERT CHANNEL
-# ==================================================
+# ============================================================
+# 📉 !drops COMMAND
+# ============================================================
 
-@bot.command()
-@commands.has_permissions(
-    manage_guild=True
-)
-async def setchannel(ctx):
-
-    await set_setting(
-        "alert_channel_id",
-        str(ctx.channel.id)
-    )
+@bot.command(name="drops")
+async def drops_command(ctx):
 
     await ctx.send(
-        f"🚨 Alerts will now be sent to "
-        f"{ctx.channel.mention}"
+        "🔎 Scanning for coins showing "
+        "downward pressure..."
     )
 
-
-# ==================================================
-# SET LIQUIDITY
-# ==================================================
-
-@bot.command()
-@commands.has_permissions(
-    manage_guild=True
-)
-async def setliquidity(
-    ctx,
-    amount=None
-):
-
-    if amount is None:
-
-        await ctx.send(
-            "Usage: `!setliquidity 5000`"
-        )
-
-        return
-
-    try:
-
-        amount = float(
-            amount.replace(
-                ",",
-                ""
-            )
-        )
-
-    except ValueError:
-
-        await ctx.send(
-            "❌ Enter a valid number."
-        )
-
-        return
-
-    if amount < 0:
-
-        await ctx.send(
-            "❌ Liquidity cannot be negative."
-        )
-
-        return
-
-    await set_setting(
-        "min_liquidity",
-        amount
+    results = await asyncio.to_thread(
+        scan_market
     )
 
-    await ctx.send(
-        f"💧 Minimum liquidity set to "
-        f"**${amount:,.0f}**."
+    results = sorted(
+        results,
+        key=lambda x: x["drop_score"],
+        reverse=True
     )
 
+    results = results[:5]
 
-# ==================================================
-# SET VOLUME
-# ==================================================
-
-@bot.command()
-@commands.has_permissions(
-    manage_guild=True
-)
-async def setvolume(
-    ctx,
-    amount=None
-):
-
-    if amount is None:
+    if not results:
 
         await ctx.send(
-            "Usage: `!setvolume 2500`"
+            "❌ No market data available."
         )
-
         return
-
-    try:
-
-        amount = float(
-            amount.replace(
-                ",",
-                ""
-            )
-        )
-
-    except ValueError:
-
-        await ctx.send(
-            "❌ Enter a valid number."
-        )
-
-        return
-
-    if amount < 0:
-
-        await ctx.send(
-            "❌ Volume cannot be negative."
-        )
-
-        return
-
-    await set_setting(
-        "min_volume",
-        amount
-    )
-
-    await ctx.send(
-        f"📊 Minimum 24h volume set to "
-        f"**${amount:,.0f}**."
-    )
-
-
-# ==================================================
-# SHOW FILTERS
-# ==================================================
-
-@bot.command()
-async def filters(ctx):
-
-    min_liquidity = await get_min_liquidity()
-
-    min_volume = await get_min_volume()
-
-    chains = await get_allowed_chains()
 
     embed = discord.Embed(
-        title="⚙️ Token Filters",
-        color=discord.Color.blue()
+        title="📉 DROP AI — Highest Risk",
+        color=discord.Color.red()
     )
 
-    embed.add_field(
-        name="💧 Minimum Liquidity",
-        value=f"${min_liquidity:,.0f}",
-        inline=True
-    )
+    for result in results:
 
-    embed.add_field(
-        name="📊 Minimum 24h Volume",
-        value=f"${min_volume:,.0f}",
-        inline=True
-    )
-
-    embed.add_field(
-        name="🌐 Enabled Chains",
-        value=", ".join(
-            sorted(chains)
-        ),
-        inline=False
-    )
+        embed.add_field(
+            name=(
+                f"{result['symbol']} — "
+                f"{result['drop_score']}/100"
+            ),
+            value=(
+                f"💰 ${result['price']:,.4f}\n"
+                f"RSI: {result['rsi']:.1f} | "
+                f"Volume: {result['volume_ratio']:.1f}x\n"
+                f"Momentum: "
+                f"{result['momentum_1h']:+.2f}%"
+            ),
+            inline=False
+        )
 
     await ctx.send(
         embed=embed
     )
 
 
-# ==================================================
-# ENABLE CHAIN
-# ==================================================
+# ============================================================
+# 🔎 !scan COMMAND
+# ============================================================
 
-@bot.command()
-@commands.has_permissions(
-    manage_guild=True
-)
-async def enablechain(
-    ctx,
-    chain=None
-):
-
-    if not chain:
-
-        await ctx.send(
-            "Usage: `!enablechain solana`"
-        )
-
-        return
-
-    chain = chain.lower().strip()
-
-    chains = await get_allowed_chains()
-
-    chains.add(chain)
-
-    await set_setting(
-        "allowed_chains",
-        ",".join(sorted(chains))
-    )
+@bot.command(name="scan")
+async def scan_command(ctx):
 
     await ctx.send(
-        f"🌐 Enabled chain: **{chain}**"
+        "🔎 Running complete FOMO + DROP scan..."
     )
 
+    results = await asyncio.to_thread(
+        scan_market
+    )
 
-# ==================================================
-# DISABLE CHAIN
-# ==================================================
-
-@bot.command()
-@commands.has_permissions(
-    manage_guild=True
-)
-async def disablechain(
-    ctx,
-    chain=None
-):
-
-    if not chain:
+    if not results:
 
         await ctx.send(
-            "Usage: `!disablechain solana`"
+            "❌ Scanner returned no results."
         )
-
         return
 
-    chain = chain.lower().strip()
-
-    chains = await get_allowed_chains()
-
-    if chain not in chains:
-
-        await ctx.send(
-            f"⚠️ **{chain}** isn't enabled."
-        )
-
-        return
-
-    chains.remove(chain)
-
-    if not chains:
-
-        await ctx.send(
-            "❌ You must keep at least "
-            "one chain enabled."
-        )
-
-        return
-
-    await set_setting(
-        "allowed_chains",
-        ",".join(sorted(chains))
+    best_fomo = max(
+        results,
+        key=lambda x: x["fomo_score"]
     )
 
-    await ctx.send(
-        f"🌐 Disabled chain: **{chain}**"
-    )
-
-
-# ==================================================
-# SHOW CHAINS
-# ==================================================
-
-@bot.command()
-async def chains(ctx):
-
-    allowed = await get_allowed_chains()
-
-    embed = discord.Embed(
-        title="🌐 Enabled Chains",
-        description="\n".join(
-            f"• `{chain}`"
-            for chain in sorted(allowed)
-        ),
-        color=discord.Color.blue()
-    )
-
-    await ctx.send(
-        embed=embed
-    )
-
-
-# ==================================================
-# WATCH X ACCOUNT
-# ==================================================
-
-@bot.command()
-async def watch(
-    ctx,
-    username=None
-):
-
-    if not username:
-
-        await ctx.send(
-            "Usage: `!watch username`"
-        )
-
-        return
-
-    username = (
-        username
-        .replace("@", "")
-        .strip()
-        .lower()
-    )
-
-    added = await add_account(
-        username
-    )
-
-    if added:
-
-        await ctx.send(
-            f"🐦 Now monitoring "
-            f"**@{username}**."
-        )
-
-    else:
-
-        await ctx.send(
-            f"⚠️ **@{username}** "
-            f"is already being monitored."
-        )
-
-
-# ==================================================
-# UNWATCH X ACCOUNT
-# ==================================================
-
-@bot.command()
-async def unwatch(
-    ctx,
-    username=None
-):
-
-    if not username:
-
-        await ctx.send(
-            "Usage: `!unwatch username`"
-        )
-
-        return
-
-    username = (
-        username
-        .replace("@", "")
-        .strip()
-        .lower()
-    )
-
-    removed = await remove_account(
-        username
-    )
-
-    if removed:
-
-        await ctx.send(
-            f"🗑️ Stopped monitoring "
-            f"**@{username}**."
-        )
-
-    else:
-
-        await ctx.send(
-            f"⚠️ **@{username}** "
-            f"wasn't being monitored."
-        )
-
-
-# ==================================================
-# LIST ACCOUNTS
-# ==================================================
-
-@bot.command()
-async def accounts(ctx):
-
-    accounts = await get_accounts()
-
-    if not accounts:
-
-        await ctx.send(
-            "📭 No X accounts are being monitored."
-        )
-
-        return
-
-    account_list = "\n".join(
-        f"🐦 @{account}"
-        for account in accounts
+    best_drop = max(
+        results,
+        key=lambda x: x["drop_score"]
     )
 
     embed = discord.Embed(
-        title="🐦 Monitored X Accounts",
-        description=account_list,
-        color=discord.Color.blue()
+        title="🧠 FOMO AI Market Scan",
+        color=discord.Color.blurple()
+    )
+
+    embed.add_field(
+        name="🚀 Strongest FOMO",
+        value=(
+            f"**{best_fomo['symbol']}**\n"
+            f"Score: **{best_fomo['fomo_score']}/100**\n"
+            f"Price: ${best_fomo['price']:,.4f}"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="📉 Strongest Drop Risk",
+        value=(
+            f"**{best_drop['symbol']}**\n"
+            f"Score: **{best_drop['drop_score']}/100**\n"
+            f"Price: ${best_drop['price']:,.4f}"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="📊 Coins Scanned",
+        value=str(len(results)),
+        inline=True
+    )
+
+    embed.add_field(
+        name="⏱️ Timeframe",
+        value=TIMEFRAME,
+        inline=True
     )
 
     await ctx.send(
@@ -1087,234 +1214,65 @@ async def accounts(ctx):
     )
 
 
-# ==================================================
-# TEST ALERT
-# ==================================================
+# ============================================================
+# ▶️ !watch COMMAND
+# ============================================================
 
-@bot.command()
-async def testalert(ctx):
+@bot.command(name="watch")
+async def watch_command(ctx):
 
-    await send_alert(
-        channel=ctx.channel,
-        title="🚨 Test Crypto Alert",
-        description=(
-            "The Discord alert system "
-            "is working correctly."
-        ),
-        alert_type="Test Alert"
+    global scanner_running
+
+    scanner_running = True
+
+    if not fomo_watcher.is_running():
+        fomo_watcher.start()
+
+    await ctx.send(
+        "🟢 **FOMO AI watcher started.**\n"
+        f"Scanning every {SCAN_INTERVAL_MINUTES} minutes."
     )
 
 
-# ==================================================
-# TEST TOKEN FEED
-# ==================================================
+# ============================================================
+# ⏹️ !stopwatch COMMAND
+# ============================================================
 
-@bot.command()
-async def testtokens(ctx):
+@bot.command(name="stopwatch")
+async def stopwatch_command(ctx):
 
-    try:
+    global scanner_running
 
-        profiles = (
-            await get_latest_token_profiles()
-        )
+    scanner_running = False
 
-        min_liquidity = await get_min_liquidity()
+    if fomo_watcher.is_running():
+        fomo_watcher.cancel()
 
-        min_volume = await get_min_volume()
+    await ctx.send(
+        "🔴 **FOMO AI watcher stopped.**"
+    )
 
-        chains = await get_allowed_chains()
 
-        details = await get_token_details(
-            profiles,
-            min_liquidity=min_liquidity,
-            min_volume=min_volume,
-            allowed_chains=chains
-        )
+# ============================================================
+# 🧪 !testsignal COMMAND
+# ============================================================
 
-        market_count = sum(
-            1
-            for item in details
-            if item.get("market")
-        )
+@bot.command(name="testsignal")
+async def test_signal(ctx):
 
-        await ctx.send(
-            f"🧪 Token feed test complete.\n\n"
-            f"Profiles received: **{len(profiles)}**\n"
-            f"Passed filters: **{len(details)}**\n"
-            f"Market data found: **{market_count}**"
-        )
+    result = analyze_symbol(
+        "BTC/USDT"
+    )
 
-    except Exception as error:
-
-        print(
-            f"Token feed test error: {error}"
-        )
+    if result is None:
 
         await ctx.send(
-            "❌ Token feed test failed. "
-            "Check Railway logs."
+            "❌ Could not analyze BTC."
         )
-
-
-# ==================================================
-# X SEARCH
-# ==================================================
-
-@bot.command()
-async def xsearch(
-    ctx,
-    *,
-    query=None
-):
-
-    global x_api_disabled
-
-    if not query:
-
-        await ctx.send(
-            "Usage: `!xsearch bitcoin`"
-        )
-
         return
 
-    if x_api_disabled:
-
-        await ctx.send(
-            "🔴 X monitoring is paused "
-            "because X API credits are depleted."
-        )
-
-        return
-
-    try:
-
-        posts = await search_recent_posts(
-            query,
-            max_results=10
-        )
-
-        if not posts:
-
-            await ctx.send(
-                "🔎 No recent X posts found."
-            )
-
-            return
-
-        for post in posts[:5]:
-
-            text = post.get(
-                "text",
-                ""
-            )
-
-            post_id = post.get(
-                "id"
-            )
-
-            url = (
-                "https://x.com/i/web/status/"
-                f"{post_id}"
-            )
-
-            embed = discord.Embed(
-                title="🐦 X Post",
-                description=text[:4000],
-                color=discord.Color.blue()
-            )
-
-            embed.add_field(
-                name="🔗 Source",
-                value=f"[View post]({url})",
-                inline=False
-            )
-
-            await ctx.send(
-                embed=embed
-            )
-
-    except Exception as error:
-
-        error_text = str(error)
-
-        if (
-            "402" in error_text
-            or "credits_depleted" in error_text
-            or "Payment Required" in error_text
-        ):
-
-            x_api_disabled = True
-
-            await ctx.send(
-                "🔴 X API credits are depleted. "
-                "X monitoring has been paused."
-            )
-
-            return
-
-        print(
-            f"Manual X search error: {error}"
-        )
-
-        await ctx.send(
-            "❌ X search failed. "
-            "Check Railway logs."
-        )
-
-
-# ==================================================
-# COMMAND LIST
-# ==================================================
-
-@bot.command(name="commands")
-async def commands_list(ctx):
-
-    embed = discord.Embed(
-        title="📋 Crypto Monitor Commands",
-        color=discord.Color.blue()
-    )
-
-    embed.add_field(
-        name="⚙️ Settings",
-        value=(
-            "`!setchannel`\n"
-            "`!setliquidity 5000`\n"
-            "`!setvolume 2500`\n"
-            "`!filters`"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="🌐 Chains",
-        value=(
-            "`!enablechain solana`\n"
-            "`!disablechain polygon`\n"
-            "`!chains`"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="🐦 X Monitoring",
-        value=(
-            "`!watch username`\n"
-            "`!unwatch username`\n"
-            "`!accounts`\n"
-            "`!xsearch bitcoin`"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="🧪 Testing",
-        value=(
-            "`!testalert`\n"
-            "`!testtokens`\n"
-            "`!status`\n"
-            "`!ping`"
-        ),
-        inline=False
+    embed = create_signal_embed(
+        result
     )
 
     await ctx.send(
@@ -1322,41 +1280,18 @@ async def commands_list(ctx):
     )
 
 
-# ==================================================
-# ERROR HANDLING
-# ==================================================
+# ============================================================
+# 🚀 START BOT
+# ============================================================
 
-@bot.event
-async def on_command_error(
-    ctx,
-    error
-):
+if __name__ == "__main__":
 
-    if isinstance(
-        error,
-        commands.CommandNotFound
-    ):
-        return
+    if not DISCORD_TOKEN:
 
-    if isinstance(
-        error,
-        commands.MissingPermissions
-    ):
-
-        await ctx.send(
-            "❌ You don't have permission "
-            "to use that command."
+        raise RuntimeError(
+            "DISCORD_TOKEN is missing from .env"
         )
 
-        return
-
-    print(
-        f"Command error: {error}"
+    bot.run(
+        DISCORD_TOKEN
     )
-
-
-# ==================================================
-# START BOT
-# ==================================================
-
-bot.run(TOKEN)
