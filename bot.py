@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+
 import ccxt
 import discord
 import pandas as pd
@@ -8,8 +9,9 @@ import pandas as pd
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
+
 # ============================================================
-# ⚙️ CONFIGURATION
+# CONFIG
 # ============================================================
 
 load_dotenv()
@@ -18,30 +20,31 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 EXCHANGE_API_KEY = os.getenv("EXCHANGE_API_KEY")
 EXCHANGE_SECRET_KEY = os.getenv("EXCHANGE_SECRET_KEY")
 
-# Discord channel for automatic FOMO alerts.
-# Put your channel ID in .env:
-# ALERT_CHANNEL_ID=123456789012345678
 ALERT_CHANNEL_ID = int(os.getenv("ALERT_CHANNEL_ID", "0"))
 
 TIMEFRAME = "1h"
 
 FAST_MA = 9
 SLOW_MA = 21
-
 RSI_PERIOD = 14
-
 VOLUME_PERIOD = 20
-
 ATR_PERIOD = 14
 
-# How often automatic scanner runs
 SCAN_INTERVAL_MINUTES = 15
 
-# Minimum score before an automatic alert
 FOMO_ALERT_SCORE = 75
 DROP_ALERT_SCORE = 75
 
-# Coins to scan
+TRADE_AMOUNT = 0.001
+
+STOP_LOSS_PERCENT = 0.02
+TAKE_PROFIT_PERCENT = 0.04
+
+
+# ============================================================
+# COINS TO SCAN
+# ============================================================
+
 SCAN_SYMBOLS = [
     "BTC/USDT",
     "ETH/USDT",
@@ -57,16 +60,9 @@ SCAN_SYMBOLS = [
     "DOT/USDT",
 ]
 
-# Existing trade amount
-TRADE_AMOUNT = 0.001
-
-# Existing paper-trading risk settings
-STOP_LOSS_PERCENT = 0.02
-TAKE_PROFIT_PERCENT = 0.04
-
 
 # ============================================================
-# 📝 LOGGING
+# LOGGING
 # ============================================================
 
 logging.basicConfig(
@@ -77,7 +73,7 @@ logging.basicConfig(
 
 
 # ============================================================
-# 🤖 DISCORD BOT
+# DISCORD
 # ============================================================
 
 intents = discord.Intents.default()
@@ -90,7 +86,7 @@ bot = commands.Bot(
 
 
 # ============================================================
-# 📡 EXCHANGE
+# BINANCE
 # ============================================================
 
 exchange = ccxt.binance({
@@ -102,27 +98,26 @@ exchange = ccxt.binance({
     }
 })
 
-# Keep your existing sandbox/testnet setup.
+# KEEP PAPER/TESTNET MODE
 exchange.set_sandbox_mode(True)
 
 
 # ============================================================
-# 🧠 SCANNER STATE
+# SCANNER STATE
 # ============================================================
-
-scanner_running = False
 
 last_alerts = {}
 
-current_position = None
-entry_price = None
-
 
 # ============================================================
-# 📊 MARKET DATA
+# MARKET DATA
 # ============================================================
 
-def fetch_market_data(symbol, timeframe=TIMEFRAME, limit=150):
+def fetch_market_data(
+    symbol,
+    timeframe=TIMEFRAME,
+    limit=150
+):
     try:
         bars = exchange.fetch_ohlcv(
             symbol,
@@ -154,13 +149,13 @@ def fetch_market_data(symbol, timeframe=TIMEFRAME, limit=150):
 
     except Exception as e:
         logging.error(
-            f"{symbol} market-data error: {e}"
+            f"{symbol}: market data error: {e}"
         )
         return None
 
 
 # ============================================================
-# 📈 INDICATORS
+# INDICATORS
 # ============================================================
 
 def calculate_indicators(df):
@@ -187,7 +182,7 @@ def calculate_indicators(df):
     )
 
     # -------------------------
-    # RSI - Wilder style
+    # RSI
     # -------------------------
 
     delta = df["close"].diff()
@@ -300,11 +295,24 @@ def calculate_indicators(df):
         df["close"].pct_change(24) * 100
     )
 
+    # -------------------------
+    # Candle percentage
+    # -------------------------
+
+    df["candle_change"] = (
+        (
+            df["close"] -
+            df["open"]
+        )
+        /
+        df["open"]
+    ) * 100
+
     return df
 
 
 # ============================================================
-# 🧠 FOMO / DROP AI-STYLE SCORING
+# FOMO / DROP ANALYSIS
 # ============================================================
 
 def analyze_symbol(symbol):
@@ -319,8 +327,7 @@ def analyze_symbol(symbol):
     if df is None:
         return None
 
-    # IMPORTANT:
-    # -2 = most recently CLOSED candle
+    # -2 = last completed candle
     # -1 = currently forming candle
     candle = df.iloc[-2]
     previous = df.iloc[-3]
@@ -330,20 +337,24 @@ def analyze_symbol(symbol):
     fomo_score = 0
     drop_score = 0
 
-    reasons_up = []
-    reasons_down = []
+    up_reasons = []
+    down_reasons = []
 
     # ========================================================
     # MA TREND
     # ========================================================
 
     if candle["fast_ma"] > candle["slow_ma"]:
-        fomo_score += 20
-        reasons_up.append("9 MA above 21 MA")
+        fomo_score += 15
+        up_reasons.append(
+            "9 MA is above 21 MA"
+        )
 
-    if candle["fast_ma"] < candle["slow_ma"]:
-        drop_score += 20
-        reasons_down.append("9 MA below 21 MA")
+    elif candle["fast_ma"] < candle["slow_ma"]:
+        drop_score += 15
+        down_reasons.append(
+            "9 MA is below 21 MA"
+        )
 
     # ========================================================
     # MA CROSS
@@ -363,11 +374,15 @@ def analyze_symbol(symbol):
 
     if bullish_cross:
         fomo_score += 25
-        reasons_up.append("Bullish MA crossover")
+        up_reasons.append(
+            "Bullish MA crossover"
+        )
 
     if bearish_cross:
         drop_score += 25
-        reasons_down.append("Bearish MA crossover")
+        down_reasons.append(
+            "Bearish MA crossover"
+        )
 
     # ========================================================
     # RSI
@@ -377,19 +392,27 @@ def analyze_symbol(symbol):
 
     if 50 <= rsi < 70:
         fomo_score += 15
-        reasons_up.append(f"RSI bullish ({rsi:.1f})")
+        up_reasons.append(
+            f"RSI bullish ({rsi:.1f})"
+        )
 
     elif rsi >= 70:
-        # Very high RSI can indicate FOMO but also overheating.
-        fomo_score += 10
-        reasons_up.append(f"RSI overheated ({rsi:.1f})")
-
+        fomo_score += 8
         drop_score += 5
-        reasons_down.append("RSI potentially overheated")
+
+        up_reasons.append(
+            f"RSI overheated ({rsi:.1f})"
+        )
+
+        down_reasons.append(
+            f"RSI potentially overheated ({rsi:.1f})"
+        )
 
     elif rsi < 40:
         drop_score += 15
-        reasons_down.append(f"Weak RSI ({rsi:.1f})")
+        down_reasons.append(
+            f"Weak RSI ({rsi:.1f})"
+        )
 
     # ========================================================
     # MACD
@@ -400,36 +423,52 @@ def analyze_symbol(symbol):
 
     if macd > macd_signal:
         fomo_score += 15
-        reasons_up.append("MACD bullish")
+        up_reasons.append(
+            "MACD bullish"
+        )
 
     else:
         drop_score += 15
-        reasons_down.append("MACD bearish")
+        down_reasons.append(
+            "MACD bearish"
+        )
 
     # ========================================================
     # VOLUME
     # ========================================================
 
-    volume_ratio = float(candle["volume_ratio"])
+    volume_ratio = float(
+        candle["volume_ratio"]
+    )
 
-    if volume_ratio >= 1.5:
+    if volume_ratio >= 2.0:
+
         fomo_score += 15
         drop_score += 10
 
-        reasons_up.append(
-            f"Volume spike {volume_ratio:.1f}x"
+        up_reasons.append(
+            f"Major volume spike ({volume_ratio:.1f}x)"
         )
 
-        reasons_down.append(
-            f"High volume {volume_ratio:.1f}x"
+        down_reasons.append(
+            f"Major volume spike ({volume_ratio:.1f}x)"
+        )
+
+    elif volume_ratio >= 1.5:
+
+        fomo_score += 12
+        drop_score += 7
+
+        up_reasons.append(
+            f"Strong volume ({volume_ratio:.1f}x)"
         )
 
     elif volume_ratio >= 1.2:
 
-        fomo_score += 8
+        fomo_score += 7
 
-        reasons_up.append(
-            f"Volume {volume_ratio:.1f}x average"
+        up_reasons.append(
+            f"Above-average volume ({volume_ratio:.1f}x)"
         )
 
     # ========================================================
@@ -444,90 +483,141 @@ def analyze_symbol(symbol):
         candle["momentum_4h"]
     )
 
+    momentum_24h = float(
+        candle["momentum_24h"]
+    )
+
     if momentum_1h > 0.5:
         fomo_score += 8
-        reasons_up.append(
+        up_reasons.append(
             f"1h momentum +{momentum_1h:.2f}%"
         )
 
     elif momentum_1h < -0.5:
         drop_score += 8
-        reasons_down.append(
+        down_reasons.append(
             f"1h momentum {momentum_1h:.2f}%"
         )
 
     if momentum_4h > 1:
         fomo_score += 7
-        reasons_up.append(
+        up_reasons.append(
             f"4h momentum +{momentum_4h:.2f}%"
         )
 
     elif momentum_4h < -1:
         drop_score += 7
-        reasons_down.append(
+        down_reasons.append(
             f"4h momentum {momentum_4h:.2f}%"
         )
 
+    if momentum_24h > 3:
+        fomo_score += 5
+        up_reasons.append(
+            f"24h momentum +{momentum_24h:.2f}%"
+        )
+
+    elif momentum_24h < -3:
+        drop_score += 5
+        down_reasons.append(
+            f"24h momentum {momentum_24h:.2f}%"
+        )
+
     # ========================================================
-    # PRICE CHANGE
+    # CANDLE STRENGTH
     # ========================================================
 
-    candle_open = float(candle["open"])
-
-    candle_change = (
-        (price - candle_open) /
-        candle_open
-    ) * 100
+    candle_change = float(
+        candle["candle_change"]
+    )
 
     if candle_change > 1:
         fomo_score += 5
-        reasons_up.append(
-            f"Candle +{candle_change:.2f}%"
+        up_reasons.append(
+            f"Strong bullish candle +{candle_change:.2f}%"
         )
 
     elif candle_change < -1:
         drop_score += 5
-        reasons_down.append(
-            f"Candle {candle_change:.2f}%"
+        down_reasons.append(
+            f"Strong bearish candle {candle_change:.2f}%"
         )
 
     # ========================================================
-    # LIMIT SCORES
+    # VOLATILITY
     # ========================================================
 
-    fomo_score = min(100, max(0, fomo_score))
-    drop_score = min(100, max(0, drop_score))
+    atr = float(candle["atr"])
+
+    atr_percent = (
+        atr / price
+    ) * 100
+
+    if atr_percent >= 3:
+        fomo_score += 5
+        drop_score += 5
+
+        up_reasons.append(
+            f"High volatility ({atr_percent:.1f}%)"
+        )
+
+        down_reasons.append(
+            f"High volatility ({atr_percent:.1f}%)"
+        )
 
     # ========================================================
-    # DIRECTION
+    # FINAL SCORES
     # ========================================================
 
-    if fomo_score >= drop_score:
+    fomo_score = max(
+        0,
+        min(100, fomo_score)
+    )
+
+    drop_score = max(
+        0,
+        min(100, drop_score)
+    )
+
+    if fomo_score > drop_score:
         direction = "PUMP WATCH"
-    else:
+    elif drop_score > fomo_score:
         direction = "DROP WATCH"
+    else:
+        direction = "NEUTRAL"
 
     return {
         "symbol": symbol,
         "price": price,
+
         "fomo_score": fomo_score,
         "drop_score": drop_score,
+
         "direction": direction,
+
         "rsi": rsi,
+
         "volume_ratio": volume_ratio,
+
         "momentum_1h": momentum_1h,
         "momentum_4h": momentum_4h,
+        "momentum_24h": momentum_24h,
+
+        "atr_percent": atr_percent,
+
         "ma_fast": float(candle["fast_ma"]),
         "ma_slow": float(candle["slow_ma"]),
+
         "macd": macd,
         "macd_signal": macd_signal,
-        "reasons_up": reasons_up,
-        "reasons_down": reasons_down
+
+        "up_reasons": up_reasons,
+        "down_reasons": down_reasons
     }
 
 
 # ============================================================
-# 📊 SCAN ALL COINS
+# SCAN MARKET
 # ============================================================
 
 def scan_market():
@@ -536,87 +626,71 @@ def scan_market():
 
     for symbol in SCAN_SYMBOLS:
 
-        try:
+        result = analyze_symbol(symbol)
 
-            result = analyze_symbol(symbol)
-
-            if result:
-                results.append(result)
-
-        except Exception as e:
-
-            logging.error(
-                f"Scanner error for {symbol}: {e}"
-            )
+        if result:
+            results.append(result)
 
     return results
 
 
 # ============================================================
-# 💬 FORMAT ALERT
+# SIGNAL EMBED
 # ============================================================
 
 def create_signal_embed(result):
-
-    symbol = result["symbol"]
 
     fomo = result["fomo_score"]
     drop = result["drop_score"]
 
     if fomo >= drop:
 
-        embed = discord.Embed(
-            title="🚀 FOMO AI ALERT",
-            description=(
-                f"**{symbol}**\n"
-                f"Potential upward momentum detected."
-            ),
-            color=discord.Color.green()
+        title = "🚀 FOMO AI ALERT"
+
+        description = (
+            f"**{result['symbol']}**\n"
+            "Potential upward momentum detected."
         )
 
-        embed.add_field(
-            name="🔥 FOMO Score",
-            value=f"**{fomo}/100**",
-            inline=True
-        )
+        color = discord.Color.green()
 
-        embed.add_field(
-            name="📉 Drop Score",
-            value=f"{drop}/100",
-            inline=True
-        )
-
-        reasons = result["reasons_up"]
+        reasons = result["up_reasons"]
 
     else:
 
-        embed = discord.Embed(
-            title="📉 DROP AI ALERT",
-            description=(
-                f"**{symbol}**\n"
-                f"Potential downward pressure detected."
-            ),
-            color=discord.Color.red()
+        title = "📉 DROP AI ALERT"
+
+        description = (
+            f"**{result['symbol']}**\n"
+            "Potential downward pressure detected."
         )
 
-        embed.add_field(
-            name="📈 FOMO Score",
-            value=f"{fomo}/100",
-            inline=True
-        )
+        color = discord.Color.red()
 
-        embed.add_field(
-            name="🔻 Drop Score",
-            value=f"**{drop}/100**",
-            inline=True
-        )
+        reasons = result["down_reasons"]
 
-        reasons = result["reasons_down"]
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        color=color
+    )
 
     embed.add_field(
         name="💰 Price",
-        value=f"${result['price']:,.4f}",
+        value=f"${result['price']:,.6f}",
         inline=False
+    )
+
+    embed.add_field(
+        name="🚀 FOMO Score",
+        value=f"{fomo}/100",
+        inline=True
+    )
+
+    embed.add_field(
+        name="📉 Drop Score",
+        value=f"{drop}/100",
+        inline=True
     )
 
     embed.add_field(
@@ -627,61 +701,75 @@ def create_signal_embed(result):
 
     embed.add_field(
         name="📊 Volume",
-        value=f"{result['volume_ratio']:.2f}x avg",
+        value=f"{result['volume_ratio']:.2f}x",
         inline=True
     )
 
     embed.add_field(
-        name="⚡ Momentum",
-        value=(
-            f"1h: {result['momentum_1h']:+.2f}%\n"
-            f"4h: {result['momentum_4h']:+.2f}%"
-        ),
+        name="⚡ 1h Momentum",
+        value=f"{result['momentum_1h']:+.2f}%",
+        inline=True
+    )
+
+    embed.add_field(
+        name="⚡ 4h Momentum",
+        value=f"{result['momentum_4h']:+.2f}%",
         inline=True
     )
 
     reason_text = "\n".join(
-        f"• {reason}"
-        for reason in reasons[:6]
+        f"• {x}"
+        for x in reasons[:7]
     )
 
     if not reason_text:
         reason_text = "No major confirmation."
 
     embed.add_field(
-        name="🧠 Why?",
+        name="🧠 Analysis",
         value=reason_text,
         inline=False
     )
 
     embed.set_footer(
-        text="Market analysis only • Not a guaranteed prediction"
+        text=(
+            "Uses closed candles • "
+            "Signal is not a guaranteed prediction"
+        )
     )
 
     return embed
 
 
 # ============================================================
-# 📢 SEND ALERT
+# SEND ALERT
 # ============================================================
 
 async def send_signal(result):
 
     if ALERT_CHANNEL_ID == 0:
+
         logging.warning(
             "ALERT_CHANNEL_ID is not configured."
         )
+
         return
 
-    channel = bot.get_channel(ALERT_CHANNEL_ID)
+    channel = bot.get_channel(
+        ALERT_CHANNEL_ID
+    )
 
     if channel is None:
+
         logging.warning(
-            "Could not find alert channel."
+            "Alert channel could not be found."
         )
+
         return
 
-    embed = create_signal_embed(result)
+    embed = create_signal_embed(
+        result
+    )
 
     await channel.send(
         embed=embed
@@ -689,108 +777,133 @@ async def send_signal(result):
 
 
 # ============================================================
-# ⏱️ AUTOMATIC FOMO WATCHER
+# AUTOMATIC WATCHER
 # ============================================================
 
-@tasks.loop(minutes=SCAN_INTERVAL_MINUTES)
+@tasks.loop(
+    minutes=SCAN_INTERVAL_MINUTES
+)
 async def fomo_watcher():
 
-    global last_alerts
-
     logging.info(
-        "🔎 Running automatic FOMO scan..."
+        "🔎 Starting automatic market scan..."
     )
 
-    results = await asyncio.to_thread(
-        scan_market
-    )
+    try:
 
-    if not results:
-        logging.warning(
-            "No scanner results."
+        results = await asyncio.to_thread(
+            scan_market
         )
-        return
 
-    # Sort strongest signals
-    strongest_fomo = sorted(
-        results,
-        key=lambda x: x["fomo_score"],
-        reverse=True
-    )
+        if not results:
 
-    strongest_drops = sorted(
-        results,
-        key=lambda x: x["drop_score"],
-        reverse=True
-    )
+            logging.warning(
+                "Scanner returned no results."
+            )
 
-    # Top FOMO signal
-    if strongest_fomo:
+            return
 
-        result = strongest_fomo[0]
+        strongest_fomo = max(
+            results,
+            key=lambda x: x["fomo_score"]
+        )
 
-        if result["fomo_score"] >= FOMO_ALERT_SCORE:
+        strongest_drop = max(
+            results,
+            key=lambda x: x["drop_score"]
+        )
+
+        # -------------------------
+        # FOMO alert
+        # -------------------------
+
+        if (
+            strongest_fomo["fomo_score"]
+            >= FOMO_ALERT_SCORE
+        ):
 
             key = (
-                result["symbol"],
+                strongest_fomo["symbol"],
                 "FOMO"
             )
 
             if key not in last_alerts:
 
-                await send_signal(result)
+                await send_signal(
+                    strongest_fomo
+                )
 
                 last_alerts[key] = True
 
-    # Top drop signal
-    if strongest_drops:
+        # -------------------------
+        # Drop alert
+        # -------------------------
 
-        result = strongest_drops[0]
-
-        if result["drop_score"] >= DROP_ALERT_SCORE:
+        if (
+            strongest_drop["drop_score"]
+            >= DROP_ALERT_SCORE
+        ):
 
             key = (
-                result["symbol"],
+                strongest_drop["symbol"],
                 "DROP"
             )
 
             if key not in last_alerts:
 
-                await send_signal(result)
+                await send_signal(
+                    strongest_drop
+                )
 
                 last_alerts[key] = True
 
-    # Reset alert memory when signals weaken
-    for key in list(last_alerts):
+        # -------------------------
+        # Reset alerts
+        # -------------------------
 
-        symbol, signal_type = key
+        for key in list(last_alerts):
 
-        matching = next(
-            (
-                x for x in results
-                if x["symbol"] == symbol
-            ),
-            None
+            symbol, alert_type = key
+
+            result = next(
+                (
+                    x for x in results
+                    if x["symbol"] == symbol
+                ),
+                None
+            )
+
+            if result is None:
+                continue
+
+            if (
+                alert_type == "FOMO"
+                and result["fomo_score"] < 60
+            ):
+
+                del last_alerts[key]
+
+            elif (
+                alert_type == "DROP"
+                and result["drop_score"] < 60
+            ):
+
+                del last_alerts[key]
+
+        logging.info(
+            f"✅ Scan complete: "
+            f"{len(results)} coins analyzed."
         )
 
-        if matching is None:
-            continue
+    except Exception as e:
 
-        if signal_type == "FOMO":
-            if matching["fomo_score"] < 60:
-                del last_alerts[key]
-
-        elif signal_type == "DROP":
-            if matching["drop_score"] < 60:
-                del last_alerts[key]
-
-    logging.info(
-        f"Scan complete: {len(results)} coins analyzed."
-    )
+        logging.error(
+            f"Watcher error: {e}"
+        )
 
 
 # ============================================================
-# 🤖 BOT READY
+# BOT READY
 # ============================================================
 
 @bot.event
@@ -813,7 +926,7 @@ async def on_ready():
     except Exception as e:
 
         logging.error(
-            f"Exchange connection error: {e}"
+            f"Binance connection error: {e}"
         )
 
     if not fomo_watcher.is_running():
@@ -826,7 +939,7 @@ async def on_ready():
 
 
 # ============================================================
-# 💰 EXISTING !price COMMAND
+# !PRICE
 # ============================================================
 
 @bot.command(name="price")
@@ -839,13 +952,13 @@ async def get_price(
 
         ticker = await asyncio.to_thread(
             exchange.fetch_ticker,
-            symbol
+            symbol.upper()
         )
 
         price = ticker["last"]
 
         await ctx.send(
-            f"📈 Current **{symbol}** price: "
+            f"📈 Current **{symbol.upper()}** price: "
             f"`${price:,.2f}`"
         )
 
@@ -857,7 +970,7 @@ async def get_price(
 
 
 # ============================================================
-# 💵 EXISTING !buy COMMAND
+# !BUY
 # ============================================================
 
 @bot.command(name="buy")
@@ -868,11 +981,19 @@ async def buy_bitcoin(
 
     symbol = "BTC/USDT"
 
+    if amount <= 0:
+
+        await ctx.send(
+            "❌ Amount must be greater than 0."
+        )
+
+        return
+
     try:
 
         await ctx.send(
             f"🔄 Processing paper buy order "
-            f"for {amount} BTC..."
+            f"for `{amount}` BTC..."
         )
 
         order = await asyncio.to_thread(
@@ -882,7 +1003,7 @@ async def buy_bitcoin(
         )
 
         embed = discord.Embed(
-            title="✅ Order Executed Successfully",
+            title="✅ Paper Buy Executed",
             color=discord.Color.green()
         )
 
@@ -893,12 +1014,6 @@ async def buy_bitcoin(
         )
 
         embed.add_field(
-            name="Type",
-            value=order["type"].upper(),
-            inline=True
-        )
-
-        embed.add_field(
             name="Amount",
             value=f"{order['amount']} BTC",
             inline=True
@@ -906,8 +1021,10 @@ async def buy_bitcoin(
 
         embed.add_field(
             name="Status",
-            value=order["status"].upper(),
-            inline=False
+            value=str(
+                order.get("status", "unknown")
+            ).upper(),
+            inline=True
         )
 
         await ctx.send(
@@ -922,7 +1039,7 @@ async def buy_bitcoin(
 
 
 # ============================================================
-# 💸 EXISTING !sell COMMAND
+# !SELL
 # ============================================================
 
 @bot.command(name="sell")
@@ -933,11 +1050,19 @@ async def sell_bitcoin(
 
     symbol = "BTC/USDT"
 
+    if amount <= 0:
+
+        await ctx.send(
+            "❌ Amount must be greater than 0."
+        )
+
+        return
+
     try:
 
         await ctx.send(
             f"🔄 Processing paper sell order "
-            f"for {amount} BTC..."
+            f"for `{amount}` BTC..."
         )
 
         order = await asyncio.to_thread(
@@ -947,19 +1072,13 @@ async def sell_bitcoin(
         )
 
         embed = discord.Embed(
-            title="✅ Order Executed Successfully",
+            title="✅ Paper Sell Executed",
             color=discord.Color.red()
         )
 
         embed.add_field(
             name="Symbol",
             value=order["symbol"],
-            inline=True
-        )
-
-        embed.add_field(
-            name="Type",
-            value=order["type"].upper(),
             inline=True
         )
 
@@ -971,8 +1090,10 @@ async def sell_bitcoin(
 
         embed.add_field(
             name="Status",
-            value=order["status"].upper(),
-            inline=False
+            value=str(
+                order.get("status", "unknown")
+            ).upper(),
+            inline=True
         )
 
         await ctx.send(
@@ -987,7 +1108,7 @@ async def sell_bitcoin(
 
 
 # ============================================================
-# 💰 EXISTING !balance COMMAND
+# !BALANCE
 # ============================================================
 
 @bot.command(name="balance")
@@ -1012,7 +1133,7 @@ async def get_balance(ctx):
         )
 
         await ctx.send(
-            "💰 **Your Paper Wallet Balance:**\n"
+            "💰 **Paper Wallet Balance**\n"
             f"• **USDT:** ${usdt_free:,.2f}\n"
             f"• **BTC:** {btc_free} BTC"
         )
@@ -1025,15 +1146,14 @@ async def get_balance(ctx):
 
 
 # ============================================================
-# 🚀 !fomo COMMAND
+# !FOMO
 # ============================================================
 
 @bot.command(name="fomo")
 async def fomo_command(ctx):
 
     await ctx.send(
-        "🔎 Scanning the market for the "
-        "strongest FOMO setups..."
+        "🔎 Scanning for the strongest FOMO setups..."
     )
 
     results = await asyncio.to_thread(
@@ -1044,15 +1164,14 @@ async def fomo_command(ctx):
         results,
         key=lambda x: x["fomo_score"],
         reverse=True
-    )
-
-    results = results[:5]
+    )[:5]
 
     if not results:
 
         await ctx.send(
             "❌ No market data available."
         )
+
         return
 
     embed = discord.Embed(
@@ -1068,11 +1187,11 @@ async def fomo_command(ctx):
                 f"{result['fomo_score']}/100"
             ),
             value=(
-                f"💰 ${result['price']:,.4f}\n"
+                f"💰 ${result['price']:,.6f}\n"
                 f"RSI: {result['rsi']:.1f} | "
                 f"Volume: {result['volume_ratio']:.1f}x\n"
-                f"Momentum: "
-                f"{result['momentum_1h']:+.2f}%"
+                f"1h: {result['momentum_1h']:+.2f}% | "
+                f"4h: {result['momentum_4h']:+.2f}%"
             ),
             inline=False
         )
@@ -1083,15 +1202,14 @@ async def fomo_command(ctx):
 
 
 # ============================================================
-# 📉 !drops COMMAND
+# !DROPS
 # ============================================================
 
 @bot.command(name="drops")
 async def drops_command(ctx):
 
     await ctx.send(
-        "🔎 Scanning for coins showing "
-        "downward pressure..."
+        "🔎 Scanning for strongest downward-risk setups..."
     )
 
     results = await asyncio.to_thread(
@@ -1102,15 +1220,14 @@ async def drops_command(ctx):
         results,
         key=lambda x: x["drop_score"],
         reverse=True
-    )
-
-    results = results[:5]
+    )[:5]
 
     if not results:
 
         await ctx.send(
             "❌ No market data available."
         )
+
         return
 
     embed = discord.Embed(
@@ -1126,11 +1243,11 @@ async def drops_command(ctx):
                 f"{result['drop_score']}/100"
             ),
             value=(
-                f"💰 ${result['price']:,.4f}\n"
+                f"💰 ${result['price']:,.6f}\n"
                 f"RSI: {result['rsi']:.1f} | "
                 f"Volume: {result['volume_ratio']:.1f}x\n"
-                f"Momentum: "
-                f"{result['momentum_1h']:+.2f}%"
+                f"1h: {result['momentum_1h']:+.2f}% | "
+                f"4h: {result['momentum_4h']:+.2f}%"
             ),
             inline=False
         )
@@ -1141,14 +1258,14 @@ async def drops_command(ctx):
 
 
 # ============================================================
-# 🔎 !scan COMMAND
+# !SCAN
 # ============================================================
 
 @bot.command(name="scan")
 async def scan_command(ctx):
 
     await ctx.send(
-        "🔎 Running complete FOMO + DROP scan..."
+        "🔎 Running full FOMO + DROP scan..."
     )
 
     results = await asyncio.to_thread(
@@ -1160,6 +1277,7 @@ async def scan_command(ctx):
         await ctx.send(
             "❌ Scanner returned no results."
         )
+
         return
 
     best_fomo = max(
@@ -1182,7 +1300,7 @@ async def scan_command(ctx):
         value=(
             f"**{best_fomo['symbol']}**\n"
             f"Score: **{best_fomo['fomo_score']}/100**\n"
-            f"Price: ${best_fomo['price']:,.4f}"
+            f"Price: ${best_fomo['price']:,.6f}"
         ),
         inline=False
     )
@@ -1192,7 +1310,7 @@ async def scan_command(ctx):
         value=(
             f"**{best_drop['symbol']}**\n"
             f"Score: **{best_drop['drop_score']}/100**\n"
-            f"Price: ${best_drop['price']:,.4f}"
+            f"Price: ${best_drop['price']:,.6f}"
         ),
         inline=False
     )
@@ -1215,52 +1333,64 @@ async def scan_command(ctx):
 
 
 # ============================================================
-# ▶️ !watch COMMAND
+# !WATCH
 # ============================================================
 
 @bot.command(name="watch")
 async def watch_command(ctx):
 
-    global scanner_running
-
-    scanner_running = True
-
     if not fomo_watcher.is_running():
+
         fomo_watcher.start()
 
-    await ctx.send(
-        "🟢 **FOMO AI watcher started.**\n"
-        f"Scanning every {SCAN_INTERVAL_MINUTES} minutes."
-    )
+        await ctx.send(
+            f"🟢 **FOMO watcher started.**\n"
+            f"Scanning every "
+            f"{SCAN_INTERVAL_MINUTES} minutes."
+        )
+
+    else:
+
+        await ctx.send(
+            "🟢 FOMO watcher is already running."
+        )
 
 
 # ============================================================
-# ⏹️ !stopwatch COMMAND
+# !STOPWATCH
 # ============================================================
 
 @bot.command(name="stopwatch")
 async def stopwatch_command(ctx):
 
-    global scanner_running
-
-    scanner_running = False
-
     if fomo_watcher.is_running():
+
         fomo_watcher.cancel()
 
-    await ctx.send(
-        "🔴 **FOMO AI watcher stopped.**"
-    )
+        await ctx.send(
+            "🔴 **FOMO watcher stopped.**"
+        )
+
+    else:
+
+        await ctx.send(
+            "🔴 FOMO watcher is already stopped."
+        )
 
 
 # ============================================================
-# 🧪 !testsignal COMMAND
+# !TESTSIGNAL
 # ============================================================
 
 @bot.command(name="testsignal")
 async def test_signal(ctx):
 
-    result = analyze_symbol(
+    await ctx.send(
+        "🧠 Analyzing BTC..."
+    )
+
+    result = await asyncio.to_thread(
+        analyze_symbol,
         "BTC/USDT"
     )
 
@@ -1269,6 +1399,7 @@ async def test_signal(ctx):
         await ctx.send(
             "❌ Could not analyze BTC."
         )
+
         return
 
     embed = create_signal_embed(
@@ -1281,7 +1412,7 @@ async def test_signal(ctx):
 
 
 # ============================================================
-# 🚀 START BOT
+# START
 # ============================================================
 
 if __name__ == "__main__":
@@ -1289,7 +1420,7 @@ if __name__ == "__main__":
     if not DISCORD_TOKEN:
 
         raise RuntimeError(
-            "DISCORD_TOKEN is missing from .env"
+            "DISCORD_TOKEN is missing from .env/Railway Variables"
         )
 
     bot.run(
